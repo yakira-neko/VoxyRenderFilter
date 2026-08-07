@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "voxyrenderfilter",
+  "version": "${version}",
+  "name": "VoxyRenderFilter",
+  "description": "Shows voxy cache coverage on a map, renders only selected regions and deletes region LOD cache.",
+  "authors": [
+    "Whisperlyric"
+  ],
+  "contact": {
+  },
+  "license": "LGPL 3.0",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.whisperlyric.voxyrenderfilter.client.VoxyRenderFilterClient"
+    ]
+  },
+  "mixins": [
+    "voxyrenderfilter.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.2",
+    "minecraft": "~26.1.2",
+    "java": ">=25",
+    "fabric-api": "*",
+    "voxy": "*"
+  }
+}
