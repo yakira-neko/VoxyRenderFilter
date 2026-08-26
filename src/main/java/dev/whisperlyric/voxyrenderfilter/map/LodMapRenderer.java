@@ -6,6 +6,8 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.AddressMode;
 import com.mojang.blaze3d.textures.FilterMode;
 import com.mojang.blaze3d.textures.GpuSampler;
+import dev.whisperlyric.voxyrenderfilter.config.VrfConfig;
+import dev.whisperlyric.voxyrenderfilter.config.VrfConfig.ScanMode;
 import dev.whisperlyric.voxyrenderfilter.tracker.ActiveTopLevelTracker;
 import dev.whisperlyric.voxyrenderfilter.util.VoxyAccess;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
@@ -20,13 +22,17 @@ import me.cortex.voxy.common.world.SaveLoadSystem3;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 import me.cortex.voxy.common.world.other.Mapper;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.texture.DynamicTexture;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.OptionalDouble;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -45,7 +51,6 @@ public final class LodMapRenderer {
     private static final int COLUMN_PX = 512; // 1 TLN column = 512x512 blocks -> pixels
     private static final int SECTION_PX = 32; // 1 lvl0 section = 32x32 blocks -> pixels
     private static final int SECTION_VOL = 32 * 32 * 32;
-    private static final int MAX_TEXTURES = 192; // upload cap (each 512x512 RGBA texture = 1MB)
     private static final int MAX_PENDING = 96;
     /** Max generation radius per request (in columns); prevents an infinite generate-evict loop when many columns are visible at low zoom. */
     private static final int GEN_RADIUS_MAX = 5;
@@ -84,11 +89,20 @@ public final class LodMapRenderer {
             new ThreadLocalMemoryBuffer(BIGGEST_SERIALIZED_SECTION_SIZE + 1024);
 
     private volatile WorldEngine engine;
+    /** True while viewing another dimension's cache: only cached images load, no engine reads/generation. */
+    private volatile boolean cacheOnly;
     private volatile Long2ObjectOpenHashMap<LongArrayList> secKeys; // packed(colX,colZ) -> keys of all LOD levels in that column
-    /** Full disk rescan requested but not yet run (set by the render thread, executed by the worker thread to avoid blocking rendering). */
+    /** Full disk rescan requested but not yet run; runs on a dedicated scan thread. */
     private volatile boolean rescanRequested;
+    /** True while a full disk scan is running on the dedicated thread. */
+    private volatile boolean scanning;
     /** Frame number of the last on-disk new-column check (every 40 frames ~ 2s). */
     private long lastStaleCheckTick;
+    /** AUTO mode: last time the disk index was refreshed (picks up in-place changes). */
+    private long lastAutoScanTime;
+    private static final long AUTO_RESCAN_INTERVAL_MS = 5000;
+    /** One-shot re-validation of rendered columns requested (map open / view distance change). */
+    private volatile boolean validationPending;
     private volatile boolean closed;
     private Thread worker;
     private GpuSampler sampler;
@@ -138,6 +152,24 @@ public final class LodMapRenderer {
         this.columns.clear();
     }
 
+    /** Clears generated columns/textures but keeps the engine and disk index (used on dimension switch). */
+    private void clearColumns() {
+        synchronized (this.lock) {
+            this.pendingSet.clear();
+            this.pendingQueue.clear();
+            this.failedColumns.clear();
+            this.lock.notifyAll();
+        }
+        this.uploads.clear();
+        for (Column c : this.columns.values()) {
+            if (c.texture != null) {
+                c.texture.close();
+            }
+            c.uploaded = false;
+        }
+        this.columns.clear();
+    }
+
     /**
      * Called every frame (render thread): requests generation of visible columns, uploads and draws.
      *
@@ -148,20 +180,27 @@ public final class LodMapRenderer {
         if (engine == null) {
             return;
         }
+        this.tick++; // frame counter for LRU bookkeeping
         if (this.engine != engine) {
             this.invalidate();
             this.engine = engine;
-            this.secKeys = this.scanKeys(engine); // full-LOD disk index, data source for requests
+            // A new world/server is always viewed in its live dimension
+            this.cacheOnly = false;
+            MapCache.INSTANCE.setWorld(Minecraft.getInstance().level);
+            // The full disk index is scanned on a dedicated thread, never blocking rendering
+            this.requestScan();
+        }
+        // Render first, then validate once (map open / view distance change) once the index is ready
+        if (this.validationPending && !this.cacheOnly && this.secKeys != null) {
+            this.validationPending = false;
+            this.runValidationPass();
         }
         // Detect new disk columns: a ring column outside the last scan triggers a background rescan,
         // so freshly generated/re-ingested regions show up without manual cache deletion
-        if (++this.tick - this.lastStaleCheckTick >= STALE_CHECK_INTERVAL) {
+        if (this.tick - this.lastStaleCheckTick >= STALE_CHECK_INTERVAL) {
             this.lastStaleCheckTick = this.tick;
             if (this.hasColumnsMissingFromScan()) {
-                this.rescanRequested = true;
-                synchronized (this.lock) {
-                    this.lock.notifyAll();
-                }
+                this.requestScan();
             }
         }
         this.processUploads();
@@ -178,9 +217,7 @@ public final class LodMapRenderer {
     /** Enqueues visible TLN columns near the center, generation radius capped to fit the texture budget. */
     private void enqueueVisible(int centerColX, int centerColZ, int halfW, int halfH, int zoom) {
         Long2ObjectOpenHashMap<LongArrayList> secs = this.secKeys;
-        if (secs == null) {
-            return; // all-level index not built yet (engine just switched); retry next frame
-        }
+        boolean cacheOnly = this.cacheOnly;
         int visHalfX = (int) Math.ceil(halfW / (double) zoom);
         int visHalfZ = (int) Math.ceil(halfH / (double) zoom);
         int genHalfX = Math.min(GEN_RADIUS_MAX, visHalfX);
@@ -189,8 +226,19 @@ public final class LodMapRenderer {
         for (int cx = centerColX - genHalfX; cx <= centerColX + genHalfX; cx++) {
             for (int cz = centerColZ - genHalfZ; cz <= centerColZ + genHalfZ; cz++) {
                 long packed = pack(cx, cz);
-                // Any LOD level (lvl0-4) having data is enough to generate: distant columns may only have coarse LOD
-                if (!secs.containsKey(packed)) {
+                if (cacheOnly) {
+                    // Other dimension: only columns that already have a cached image are loadable
+                    if (!MapCache.INSTANCE.hasCached(cx, cz)) {
+                        continue;
+                    }
+                } else if (secs != null) {
+                    // Any LOD level (lvl0-4) having data is enough to generate: distant columns may only have coarse LOD
+                    if (!secs.containsKey(packed)) {
+                        continue;
+                    }
+                } else if (!MapCache.INSTANCE.hasCached(cx, cz)) {
+                    // Disk index not built yet (engine just switched): still render-first the cached
+                    // tiles so the map appears instantly; the scan fills the rest next frames
                     continue;
                 }
                 if (this.columns.containsKey(packed) || this.pendingSet.contains(packed)) {
@@ -205,11 +253,11 @@ public final class LodMapRenderer {
             }
         }
         visible.sort(Comparator.comparingLong(a -> distSq(a, centerColX, centerColZ)));
-        // VRAM budget: generated + queued columns must not exceed MAX_TEXTURES; the rest is requested next frame
-        int budget = Math.max(0, MAX_TEXTURES - this.columns.size() - this.pendingSet.size());
+        // No LRU eviction: every generated column stays rendered. Only the pending queue is
+        // depth-limited so the worker stays responsive; extra visible columns are enqueued next frame.
         synchronized (this.lock) {
             for (long packed : visible) {
-                if (this.pendingSet.size() >= MAX_PENDING || this.pendingSet.size() >= budget) {
+                if (this.pendingSet.size() >= MAX_PENDING) {
                     break;
                 }
                 this.pendingSet.add(packed);
@@ -225,6 +273,20 @@ public final class LodMapRenderer {
         long dx = (packed >> 32) - cx;
         long dz = (int) packed - cz;
         return dx * dx + dz * dz;
+    }
+
+    /** Section keys of the finest lvl0 level only; falls back to all keys when a column has no lvl0 data. */
+    private static List<Long> lvl0Keys(List<Long> keys) {
+        List<Long> lvl0 = null;
+        for (long key : keys) {
+            if (WorldEngine.getLevel(key) == 0) {
+                if (lvl0 == null) {
+                    lvl0 = new ArrayList<>();
+                }
+                lvl0.add(key);
+            }
+        }
+        return lvl0 != null ? lvl0 : keys;
     }
 
     /** Maps every stored section key to its TLN column; coarse-only columns are included so distant areas render. */
@@ -250,7 +312,6 @@ public final class LodMapRenderer {
 
     private void workerLoop() {
         while (!this.closed) {
-            this.performRescanIfRequested();
             Long packed = this.nextPending();
             if (packed == null) {
                 return;
@@ -266,17 +327,196 @@ public final class LodMapRenderer {
         }
     }
 
-    /** Executes the full disk rescan on the worker thread (replaces the secKeys reference), avoiding a blocking scan on the render thread. */
-    private void performRescanIfRequested() {
-        if (!this.rescanRequested) {
+    /**
+     * Requests a full disk rescan. The scan runs on a DEDICATED thread so it never blocks the
+     * generation worker: render-first (loading cached images) stays responsive even while the
+     * scan is heavy. Concurrent requests coalesce: an active scan re-runs on completion.
+     */
+    private void requestScan() {
+        synchronized (this.lock) {
+            if (this.scanning) {
+                this.rescanRequested = true;
+                return;
+            }
+            this.scanning = true;
+            Thread t = new Thread(this::scanLoop, "VRF lod scan");
+            t.setDaemon(true);
+            t.start();
+        }
+    }
+
+    private void scanLoop() {
+        try {
+            WorldEngine eng = this.engine;
+            if (eng != null) {
+                // Runs in parallel with the coverage overlay's scan (LMDB read cursors are concurrent-safe)
+                this.secKeys = this.scanKeys(eng);
+            }
+        } catch (Throwable ignored) {
+            // A failed scan is retried on the next request
+        } finally {
+            synchronized (this.lock) {
+                this.scanning = false;
+                if (this.rescanRequested) {
+                    this.rescanRequested = false;
+                    Thread t = new Thread(this::scanLoop, "VRF lod scan");
+                    t.setDaemon(true);
+                    t.start();
+                }
+                this.lock.notifyAll();
+            }
+        }
+    }
+
+    /**
+     * AUTO mode background refresh, called from the client tick: keeps the map cache around the
+     * player (vanilla render distance) in sync with the disk, so opening the map is instant.
+     * This only pre-generates missing columns; re-validation of rendered columns happens once
+     * per trigger (map open, view distance change) via {@link #requestValidation()}.
+     */
+    public void refreshNearPlayer() {
+        if (VrfConfig.INSTANCE.scanMode != ScanMode.AUTO || this.cacheOnly) {
             return;
         }
-        this.rescanRequested = false;
-        WorldEngine eng = this.engine;
-        if (eng == null) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer player = mc.player;
+        WorldEngine cur = VoxyAccess.getCurrentEngine();
+        if (cur == null || player == null) {
             return;
         }
-        this.secKeys = this.scanKeys(eng);
+        // Associate the engine even when the map is closed, so the background sync keeps running
+        if (this.engine != cur) {
+            this.invalidate();
+            this.engine = cur;
+            // A new world/server is always viewed in its live dimension
+            this.cacheOnly = false;
+            MapCache.INSTANCE.setWorld(mc.level);
+            this.requestScan();
+        }
+        // Periodically refresh the disk index so in-place changes (new chunks saved inside an
+        // existing column) are picked up, not only brand-new ring columns
+        long now = System.currentTimeMillis();
+        if (now - this.lastAutoScanTime >= AUTO_RESCAN_INTERVAL_MS) {
+            this.lastAutoScanTime = now;
+            this.requestScan();
+        }
+        Long2ObjectOpenHashMap<LongArrayList> secs = this.secKeys;
+        if (secs == null) {
+            return; // initial scan still in flight
+        }
+        int radius = Math.max(1, mc.options.getEffectiveRenderDistance() / 32 + 1);
+        int pcx = (int) Math.floor(player.getX() / 512.0);
+        int pcz = (int) Math.floor(player.getZ() / 512.0);
+        // Pre-generate missing columns around the player so the map opens ready
+        this.enqueueVisible(pcx, pcz, radius * 512, radius * 512, 512);
+        this.startWorkerIfNeeded();
+    }
+
+    /** Requests a one-shot re-validation of the rendered columns (map open / view distance change). */
+    public void requestValidation() {
+        this.validationPending = true;
+    }
+
+    /** One-shot pass: drops rendered columns whose cached hash no longer matches the disk, so they regenerate. */
+    private void runValidationPass() {
+        if (this.cacheOnly) {
+            return;
+        }
+        Long2ObjectOpenHashMap<LongArrayList> secs = this.secKeys;
+        if (secs == null) {
+            return;
+        }
+        java.util.List<Long> stale = new ArrayList<>();
+        synchronized (this.lock) {
+            for (long packed : this.columns.keySet()) {
+                int cx = (int) (packed >> 32);
+                int cz = (int) packed;
+                LongArrayList list = secs.get(packed);
+                if (list == null || list.isEmpty()) {
+                    continue;
+                }
+                long hash = MapCache.computeHash(lvl0Keys(new ArrayList<>(list)));
+                if (!MapCache.INSTANCE.hashMatches(cx, cz, hash)) {
+                    stale.add(packed);
+                }
+            }
+            for (long packed : stale) {
+                Column c = this.columns.remove(packed);
+                if (c != null) {
+                    if (c.texture != null) {
+                        c.texture.close();
+                    }
+                    c.uploaded = false;
+                }
+                this.pendingSet.add(packed);
+                this.pendingQueue.addLast(packed);
+            }
+            if (!stale.isEmpty()) {
+                this.lock.notifyAll();
+            }
+        }
+    }
+
+    /** Drops and re-generates the given columns, deleting their cached images first (region rescan).
+     * A new rescan terminates pending regeneration from any previous one. */
+    public void rescanColumns(LongOpenHashSet columns) {
+        if (columns.isEmpty()) {
+            return;
+        }
+        synchronized (this.lock) {
+            // Supersede the previous rescan: drop its still-pending columns and start fresh
+            this.pendingQueue.clear();
+            this.pendingSet.clear();
+            LongIterator it = columns.iterator();
+            while (it.hasNext()) {
+                long packed = it.nextLong();
+                int cx = ActiveTopLevelTracker.columnX(packed);
+                int cz = ActiveTopLevelTracker.columnZ(packed);
+                MapCache.INSTANCE.deleteImage(cx, cz);
+                Column c = this.columns.remove(packed);
+                if (c != null) {
+                    if (c.texture != null) {
+                        c.texture.close();
+                    }
+                    c.uploaded = false;
+                }
+                this.failedColumns.remove(packed);
+                this.pendingSet.add(packed);
+                this.pendingQueue.addLast(packed);
+            }
+            this.lock.notifyAll();
+        }
+        this.startWorkerIfNeeded();
+    }
+
+    /** Switches the map to another dimension's cached data; the current dimension restores normal mode. */
+    public void viewDimension(String dimId) {
+        // "Other" means different from the player's LIVE dimension, not the previously viewed one:
+        // cycling back to the live dimension must restore arrow, coverage and normal rendering
+        String live = liveDimensionId();
+        boolean other = dimId != null && !dimId.equals(live);
+        this.cacheOnly = other;
+        MapCache.INSTANCE.setDimension(dimId);
+        this.clearColumns();
+        if (!other) {
+            // Back to the live dimension: re-point the cache and rescan the disk index
+            MapCache.INSTANCE.setWorld(Minecraft.getInstance().level);
+            this.requestScan();
+        }
+    }
+
+    /** Sanitized dimension id the player is currently in, e.g. "minecraft_the_nether". */
+    private static String liveDimensionId() {
+        Level level = Minecraft.getInstance().level;
+        if (level == null) {
+            return null;
+        }
+        return level.dimension().identifier().toString().replace(':', '_');
+    }
+
+    /** Whether the map is currently showing another dimension's cached data (engine reads disabled). */
+    public boolean isCacheOnly() {
+        return this.cacheOnly;
     }
 
     /** Whether any ring column (actually created by voxy) is missing from the disk scan, i.e. the disk has new data. */
@@ -326,12 +566,35 @@ public final class LodMapRenderer {
         if (backend == null) {
             return;
         }
-        Long2ObjectOpenHashMap<LongArrayList> secs = this.secKeys;
-        if (secs == null) {
-            return; // full-level index not built yet, try next frame
-        }
         int colX = (int) (packed >> 32);
         int colZ = (int) packed;
+        if (this.cacheOnly) {
+            // Other dimension: only load what is already cached, never touch engine data
+            NativeImage cached = MapCache.INSTANCE.loadImage(colX, colZ);
+            if (cached != null) {
+                Column col = new Column(packed);
+                col.image = cached;
+                this.columns.put(packed, col);
+                this.uploads.add(col);
+            }
+            return;
+        }
+        // Render first: a cached image needs no disk index, so it can appear immediately even
+        // before the async scan finishes. Re-validation happens in a one-shot pass or triggers.
+        NativeImage cached = MapCache.INSTANCE.loadImage(colX, colZ);
+        if (cached != null) {
+            Column col = new Column(packed);
+            col.image = cached;
+            this.columns.put(packed, col);
+            this.uploads.add(col);
+            return;
+        }
+        Long2ObjectOpenHashMap<LongArrayList> secs = this.secKeys;
+        if (secs == null) {
+            return; // no cache and no disk index yet; retry next frame
+        }
+        boolean cacheOnlyAtStart = this.cacheOnly;
+        String dimAtStart = MapCache.INSTANCE.getDimension();
         LongArrayList list = secs.get(packed);
         if (list == null || list.isEmpty()) {
             return;
@@ -366,9 +629,11 @@ public final class LodMapRenderer {
         Int2IntOpenHashMap colorCache = new Int2IntOpenHashMap();
         colorCache.defaultReturnValue(-1);
         for (long key : keys) {
-            if (this.engine != eng) {
+            if (this.engine != eng
+                    || this.cacheOnly != cacheOnlyAtStart
+                    || !Objects.equals(dimAtStart, MapCache.INSTANCE.getDimension())) {
                 img.close();
-                return; // engine switched, discard
+                return; // engine/dimension switched, discard
             }
             int lvl = WorldEngine.getLevel(key);
             // Must use the real lvl in the section key, and a fresh scratch reference per call
@@ -391,6 +656,8 @@ public final class LodMapRenderer {
                     lvl, px0, pz0, WorldEngine.getY(key), lvl0Local);
         }
         applyShadows(img, colors, heights);
+        // Persist the freshly generated texture for the next session (stable lvl0-key hash)
+        MapCache.INSTANCE.saveImage(colX, colZ, img, MapCache.computeHash(lvl0Keys(keys)));
         Column col = new Column(packed);
         col.image = img;
         this.columns.put(packed, col);
@@ -502,7 +769,7 @@ public final class LodMapRenderer {
             tex.upload();
             cur.texture = tex;
             cur.uploaded = true;
-            cur.lastUsed = ++this.tick;
+            cur.lastUsed = this.tick;
         }
     }
 
@@ -533,34 +800,10 @@ public final class LodMapRenderer {
             if (sx + size < 0 || sy + size < 0 || sx > guiWidth || sy > guiHeight) {
                 continue;
             }
-            c.lastUsed = ++this.tick;
+            c.lastUsed = this.tick;
             // 26.x blit: 4 ints are absolute (x0,y0,x1,y1), 4 floats are normalized (u0,u1,v0,v1) UVs
             extractor.blit(c.texture.getTextureView(), this.sampler, sx, sy,
                     sx + size, sy + size, 0f, 1f, 0f, 1f);
-        }
-        this.evictIfNeeded();
-    }
-
-    /** Close and evict the least recently used columns once the texture cap is exceeded. */
-    private void evictIfNeeded() {
-        if (this.columns.size() <= MAX_TEXTURES) {
-            return;
-        }
-        List<Column> uploaded = new ArrayList<>();
-        for (Column c : this.columns.values()) {
-            if (c.uploaded) {
-                uploaded.add(c);
-            }
-        }
-        uploaded.sort(Comparator.comparingLong(c -> c.lastUsed));
-        int toRemove = this.columns.size() - MAX_TEXTURES;
-        for (int i = 0; i < toRemove && i < uploaded.size(); i++) {
-            Column c = uploaded.get(i);
-            if (c.texture != null) {
-                c.texture.close();
-            }
-            c.uploaded = false;
-            this.columns.remove(c.packed, c);
         }
     }
 

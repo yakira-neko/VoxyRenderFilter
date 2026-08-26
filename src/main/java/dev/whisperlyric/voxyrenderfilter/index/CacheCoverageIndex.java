@@ -69,6 +69,7 @@ public final class CacheCoverageIndex {
             try {
                 LongOpenHashSet sections = new LongOpenHashSet();
                 LongOpenHashSet columns = new LongOpenHashSet();
+                // Runs in parallel with the map's disk scans (LMDB read cursors are concurrent-safe)
                 engine.storage.iteratePositions(-1, key -> {
                     int lvl = WorldEngine.getLevel(key);
                     int x = WorldEngine.getX(key);

@@ -1,9 +1,12 @@
 package dev.whisperlyric.voxyrenderfilter.gui;
 
+import dev.whisperlyric.voxyrenderfilter.config.VrfConfig;
+import dev.whisperlyric.voxyrenderfilter.config.VrfConfig.ScanMode;
 import dev.whisperlyric.voxyrenderfilter.filter.RectFilter;
 import dev.whisperlyric.voxyrenderfilter.filter.RenderFilterState;
 import dev.whisperlyric.voxyrenderfilter.index.CacheCoverageIndex;
 import dev.whisperlyric.voxyrenderfilter.map.LodMapRenderer;
+import dev.whisperlyric.voxyrenderfilter.map.MapCache;
 import dev.whisperlyric.voxyrenderfilter.purge.CachePurgeService;
 import dev.whisperlyric.voxyrenderfilter.purge.RenderNodeRefresh;
 import dev.whisperlyric.voxyrenderfilter.tracker.ActiveTopLevelTracker;
@@ -48,7 +51,7 @@ public class MapScreen extends Screen {
     /** Max zoom: px per TLN column (512 blocks); 4096 = 128px per chunk. */
     private static final int MAX_ZOOM = 4096;
     /** Pan distance per WASD/arrow keypress as a screen fraction; 1/16 of the former half-screen step (~1/32 screen). */
-    private static final double PAN_FRACTION = 0.03;
+    private static final double PAN_FRACTION = 0.05;
     /** Above this zoom (>= 2px per chunk) selection snaps to lvl0 sections (2x2 chunks). */
     private static final int CHUNK_SELECT_ZOOM = 128;
     /** Above this zoom (>= 4px per chunk) draw a chunk grid inside selections. */
@@ -65,6 +68,13 @@ public class MapScreen extends Screen {
     private static final int OVERLAY_BUTTON_INDEX = 5;
     /** Index of the selection-mode toggle (appended after the overlay button). */
     private static final int SELECT_BUTTON_INDEX = 6;
+    /** Index of the scan-mode toggle (after the selection toggle). */
+    private static final int SCAN_BUTTON_INDEX = 7;
+    /** Index of the dimension-cycle button (last). */
+    private static final int DIM_BUTTON_INDEX = 8;
+    private static final String SCAN_LABEL_AUTO = "voxyrenderfilter.map.button.scan.auto";
+    private static final String SCAN_LABEL_MANUAL = "voxyrenderfilter.map.button.scan.manual";
+    private static final String DIM_LABEL = "voxyrenderfilter.map.button.dimension";
     /**
      * View distance input bounds, mirroring voxy's own config slider value (10..1024) exactly:
      * same number, same unit, voxy stays the source of truth.
@@ -142,6 +152,8 @@ public class MapScreen extends Screen {
     /** Map screen background alpha (0-255); 255 = fully opaque (default), adjustable via the input box. */
     private int backgroundAlpha = 255;
     private EditBox backgroundAlphaBox;
+    /** False once init() has run for a real map open; window resizes skip the one-shot work. */
+    private boolean firstInit = true;
 
     public MapScreen() {
         super(Component.translatable("voxyrenderfilter.map.title"));
@@ -151,7 +163,14 @@ public class MapScreen extends Screen {
     @Override
     protected void init() {
         this.centerOnPlayer();
-        this.requestScan();
+        VrfConfig.INSTANCE.load();
+        this.backgroundAlpha = VrfConfig.INSTANCE.backgroundAlpha;
+        if (VrfConfig.INSTANCE.scanMode == ScanMode.AUTO) {
+            // Render-first: show the cache immediately, then re-validate it once in the background
+            LodMapRenderer.INSTANCE.requestValidation();
+        }
+        // Coverage loads when the map opens (event-driven, not proactive)
+        this.cacheIndex.requestScan(VoxyAccess.getCurrentEngine(), false);
         this.buttons.clear();
         // Button width fits the widest label, right-aligned column
         String[] labels = {
@@ -161,16 +180,20 @@ public class MapScreen extends Screen {
                 "voxyrenderfilter.map.button.rescan",
                 "voxyrenderfilter.map.button.center",
                 this.overlayLabel(),
-                this.selectLabel()
+                this.selectLabel(),
+                this.scanLabel(),
+                this.dimLabel()
         };
         List<Runnable> actions = List.of(
                 this::clearFilter,
                 this::purgeSelection,
                 this::clearSelection,
-                this::requestScan,
+                this::rescanSelection,
                 this::centerOnPlayer,
                 this::toggleOverlays,
-                this::toggleSelectionMode);
+                this::toggleSelectionMode,
+                this::toggleScanMode,
+                this::cycleDimension);
         int maxW = 0;
         for (String label : labels) {
             maxW = Math.max(maxW, this.mc.font.width(Component.translatable(label)));
@@ -180,6 +203,9 @@ public class MapScreen extends Screen {
         maxW = Math.max(maxW, this.mc.font.width(Component.translatable(OVERLAY_LABEL_OFF)));
         maxW = Math.max(maxW, this.mc.font.width(Component.translatable(SELECT_LABEL_ON)));
         maxW = Math.max(maxW, this.mc.font.width(Component.translatable(SELECT_LABEL_OFF)));
+        maxW = Math.max(maxW, this.mc.font.width(Component.translatable(SCAN_LABEL_AUTO)));
+        maxW = Math.max(maxW, this.mc.font.width(Component.translatable(SCAN_LABEL_MANUAL)));
+        maxW = Math.max(maxW, this.mc.font.width(this.dimLabelComponent()));
         int w = maxW + 14;
         int x = this.width - w - 4;
         int y = 4;
@@ -201,11 +227,30 @@ public class MapScreen extends Screen {
         this.backgroundAlphaBox.setFocused(false);
     }
 
-    private void requestScan() {
-        // Force a disk rescan (ignores an in-flight scan) and invalidate the terrain texture;
-        // the render thread rescans all LOD levels on disk and rebuilds next frame
-        this.cacheIndex.requestScan(VoxyAccess.getCurrentEngine(), true);
-        LodMapRenderer.INSTANCE.invalidate();
+    /**
+     * Rescans only the region-file selections (chunk-level selections are ignored), asynchronously:
+     * their cached images are deleted and the columns regenerate from the current disk state.
+     * In AUTO mode this is a no-op: the background scan already keeps everything in sync.
+     */
+    private void rescanSelection() {
+        if (VrfConfig.INSTANCE.scanMode == ScanMode.AUTO) {
+            return;
+        }
+        LongOpenHashSet columns = new LongOpenHashSet();
+        for (SelRect sel : this.selections) {
+            if (sel.sectionUnit()) {
+                continue; // chunk-level selection: ignored
+            }
+            RectFilter r = sel.chunkRect();
+            for (int tx = r.minX() >> 5; tx <= r.maxX() >> 5; tx++) {
+                for (int tz = r.minZ() >> 5; tz <= r.maxZ() >> 5; tz++) {
+                    columns.add(ActiveTopLevelTracker.pack(tx, tz));
+                }
+            }
+        }
+        if (!columns.isEmpty()) {
+            LodMapRenderer.INSTANCE.rescanColumns(columns);
+        }
     }
 
     private void centerOnPlayer() {
@@ -244,10 +289,59 @@ public class MapScreen extends Screen {
     /** Toggles selection mode (off = left-drag pans the map, selections kept) and refreshes the button label. */
     private void toggleSelectionMode() {
         this.selectionMode = !this.selectionMode;
-        if (SELECT_BUTTON_INDEX < this.buttons.size()) {
-            ButtonZone b = this.buttons.get(SELECT_BUTTON_INDEX);
-            this.buttons.set(SELECT_BUTTON_INDEX,
-                    new ButtonZone(b.x(), b.y(), b.w(), b.h(), this.selectLabel(), this::toggleSelectionMode));
+        this.updateButtonLabel(SELECT_BUTTON_INDEX, this.selectLabel(), this::toggleSelectionMode);
+    }
+
+    /** Translation key of the current scan-mode state. */
+    private String scanLabel() {
+        return VrfConfig.INSTANCE.scanMode == ScanMode.AUTO ? SCAN_LABEL_AUTO : SCAN_LABEL_MANUAL;
+    }
+
+    /** Toggles manual/auto scanning (persisted) and refreshes the button label. */
+    private void toggleScanMode() {
+        VrfConfig.INSTANCE.scanMode = VrfConfig.INSTANCE.scanMode == ScanMode.AUTO ? ScanMode.MANUAL : ScanMode.AUTO;
+        VrfConfig.INSTANCE.save();
+        this.updateButtonLabel(SCAN_BUTTON_INDEX, this.scanLabel(), this::toggleScanMode);
+        if (VrfConfig.INSTANCE.scanMode == ScanMode.AUTO) {
+            // Kick off the background refresh and a one-shot validation immediately
+            LodMapRenderer.INSTANCE.refreshNearPlayer();
+            LodMapRenderer.INSTANCE.requestValidation();
+        }
+    }
+
+    /** "维度:<dimensionId>" component for the currently viewed dimension. */
+    private Component dimLabelComponent() {
+        String dim = MapCache.INSTANCE.getDimension();
+        return Component.translatable(DIM_LABEL, dim != null ? dim : "?");
+    }
+
+    /** Translation key of the dimension button (dynamic text is the component with the dimension id). */
+    private String dimLabel() {
+        return DIM_LABEL;
+    }
+
+    /** Cycles the map through all dimensions that already have cached images. */
+    private void cycleDimension() {
+        java.util.List<String> dims = MapCache.INSTANCE.listDimensions();
+        if (dims.isEmpty()) {
+            return;
+        }
+        String current = MapCache.INSTANCE.getDimension();
+        int idx = dims.indexOf(current);
+        String next = dims.get((idx + 1) % dims.size());
+        LodMapRenderer.INSTANCE.viewDimension(next);
+        // Coverage only reflects the player's live dimension: refresh it when the map is back on it
+        if (java.util.Objects.equals(next, this.currentDimId())) {
+            this.cacheIndex.requestScan(VoxyAccess.getCurrentEngine(), false);
+        }
+        this.updateButtonLabel(DIM_BUTTON_INDEX, this.dimLabel(), this::cycleDimension);
+    }
+
+    /** Replaces a dynamic button's label in place (keeps position/size/action). */
+    private void updateButtonLabel(int index, String label, Runnable action) {
+        if (index < this.buttons.size()) {
+            ButtonZone b = this.buttons.get(index);
+            this.buttons.set(index, new ButtonZone(b.x(), b.y(), b.w(), b.h(), label, action));
         }
     }
 
@@ -299,6 +393,8 @@ public class MapScreen extends Screen {
         if (renderSystem != null) {
             renderSystem.setRenderDistance(sectionRenderDistance);
         }
+        // View distance change is a validation trigger: re-check the freshly resized ring
+        LodMapRenderer.INSTANCE.requestValidation();
     }
 
     /** Draws the view distance input box with a label; hidden when voxy config is unavailable. */
@@ -330,6 +426,8 @@ public class MapScreen extends Screen {
             return;
         }
         this.backgroundAlpha = value;
+        VrfConfig.INSTANCE.backgroundAlpha = value;
+        VrfConfig.INSTANCE.save();
     }
 
     /** Draws the background transparency input box with a label; reflects the current alpha when not focused. */
@@ -383,6 +481,9 @@ public class MapScreen extends Screen {
 
     /** Clears the render filter: restores rendering of all TLN columns. */
     private void clearFilter() {
+        if (LodMapRenderer.INSTANCE.isCacheOnly()) {
+            return; // previewing another dimension: no filter operations
+        }
         RenderFilterState.INSTANCE.clear();
         // Rebuild the nodes removed by the filter right away, no voxy disable/enable needed
         RenderNodeRefresh.clearFilterImmediately();
@@ -391,8 +492,8 @@ public class MapScreen extends Screen {
 
     /** Applies all selections (chunk coords -> lvl0 section coords) to the render filter with the given mode. */
     private void applyFilterToSelections(RenderFilterState.Mode mode) {
-        if (this.selections.isEmpty()) {
-            return;
+        if (this.selections.isEmpty() || LodMapRenderer.INSTANCE.isCacheOnly()) {
+            return; // previewing another dimension: no filter operations
         }
         List<RectFilter> sectionRects = new ArrayList<>();
         for (SelRect sel : this.selections) {
@@ -418,6 +519,9 @@ public class MapScreen extends Screen {
      * (cleared when nothing is left); in ALLOW mode the rect is added back to the allow rect.
      */
     private void unblockSelection() {
+        if (LodMapRenderer.INSTANCE.isCacheOnly()) {
+            return; // previewing another dimension: no filter operations
+        }
         RenderFilterState state = RenderFilterState.INSTANCE;
         for (SelRect sel : this.selections) {
             RectFilter sectionRect = this.selectionSectionRect(sel.chunkRect());
@@ -458,23 +562,29 @@ public class MapScreen extends Screen {
             return;
         }
         this.menuItems.clear();
-        RenderFilterState state = RenderFilterState.INSTANCE;
-        // When every selection is fully blocked, the first item becomes "unblock" instead
-        boolean fullyBlocked = true;
-        for (SelRect sel : this.selections) {
-            if (!state.isRectFullyBlocked(this.selectionSectionRect(sel.chunkRect()))) {
-                fullyBlocked = false;
-                break;
+        // Previewing another dimension: block/allow filter items are disabled, but invert stays
+        // available (it toggles the global filter polarity); cache ops remain usable
+        if (LodMapRenderer.INSTANCE.isCacheOnly()) {
+            this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.invert", this::invertFilter));
+        } else {
+            RenderFilterState state = RenderFilterState.INSTANCE;
+            // When every selection is fully blocked, the first item becomes "unblock" instead
+            boolean fullyBlocked = true;
+            for (SelRect sel : this.selections) {
+                if (!state.isRectFullyBlocked(this.selectionSectionRect(sel.chunkRect()))) {
+                    fullyBlocked = false;
+                    break;
+                }
             }
+            this.menuItems.add(new MenuEntry(fullyBlocked
+                            ? "voxyrenderfilter.map.menu.unblock"
+                            : "voxyrenderfilter.map.menu.block",
+                    fullyBlocked ? this::unblockSelection
+                            : () -> this.applyFilterToSelections(RenderFilterState.Mode.BLOCK)));
+            this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.allow",
+                    () -> this.applyFilterToSelections(RenderFilterState.Mode.ALLOW)));
+            this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.invert", this::invertFilter));
         }
-        this.menuItems.add(new MenuEntry(fullyBlocked
-                        ? "voxyrenderfilter.map.menu.unblock"
-                        : "voxyrenderfilter.map.menu.block",
-                fullyBlocked ? this::unblockSelection
-                        : () -> this.applyFilterToSelections(RenderFilterState.Mode.BLOCK)));
-        this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.allow",
-                () -> this.applyFilterToSelections(RenderFilterState.Mode.ALLOW)));
-        this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.invert", this::invertFilter));
         this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.purge", this::purgeSelection));
         this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.clear", this::clearSelection));
         // Size the menu to its content: width = widest label + padding, height = items + separator
@@ -507,6 +617,23 @@ public class MapScreen extends Screen {
 
     private void purgeSelection() {
         if (this.selections.isEmpty() || this.purgeState == 1) {
+            return;
+        }
+        if (LodMapRenderer.INSTANCE.isCacheOnly()) {
+            // Previewing another dimension: only delete that dimension's cached map tiles for the
+            // selection; the live world's LOD data must not be touched
+            LongOpenHashSet columns = new LongOpenHashSet();
+            for (SelRect sel : this.selections) {
+                RectFilter r = sel.chunkRect();
+                for (int tx = r.minX() >> 5; tx <= r.maxX() >> 5; tx++) {
+                    for (int tz = r.minZ() >> 5; tz <= r.maxZ() >> 5; tz++) {
+                        columns.add(ActiveTopLevelTracker.pack(tx, tz));
+                    }
+                }
+            }
+            if (!columns.isEmpty()) {
+                LodMapRenderer.INSTANCE.rescanColumns(columns);
+            }
             return;
         }
         WorldEngine engine = VoxyAccess.getCurrentEngine();
@@ -616,14 +743,15 @@ public class MapScreen extends Screen {
         // Real LOD terrain map: request the visible columns and draw (bottom layer)
         LodMapRenderer.INSTANCE.update(extractor, VoxyAccess.getCurrentEngine(),
                 this.centerTlnX, this.centerTlnZ, this.zoom, this.width, this.height);
-        if (this.showOverlays) {
+        // Overlays are engine-based; hide them while viewing another dimension's cache
+        if (this.showOverlays && !LodMapRenderer.INSTANCE.isCacheOnly()) {
             this.drawCachedColumns(extractor);
             this.drawTopLevelColumns(extractor);
         }
         this.drawChunkGrid(extractor);
         this.drawSelections(extractor);
         this.drawRightDragPreview(extractor);
-        if (this.showOverlays) {
+        if (this.showOverlays && !LodMapRenderer.INSTANCE.isCacheOnly()) {
             this.drawFilterBlockOverlay(extractor);
         }
         this.drawPlayer(extractor);
@@ -687,6 +815,26 @@ public class MapScreen extends Screen {
         }
     }
 
+    /** Current voxy ring radius in TLN columns (mirrors voxy's setRenderDistance = ceil(sd+1)), or -1 when unavailable. */
+    private int ringRadiusColumns() {
+        VoxyConfig config = VoxyConfig.CONFIG;
+        if (config == null || this.mc.player == null) {
+            return -1;
+        }
+        return (int) Math.ceil(config.sectionRenderDistance + 1);
+    }
+
+    /** Whether the column is beyond the current voxy ring radius; hides stale tracker entries while a ring drain is still in progress. */
+    private boolean outsideRing(int tlnX, int tlnZ) {
+        int ringR = this.ringRadiusColumns();
+        if (ringR < 0) {
+            return false;
+        }
+        int pcx = (int) Math.floor(this.mc.player.getX() / 512.0);
+        int pcz = (int) Math.floor(this.mc.player.getZ() / 512.0);
+        return Math.max(Math.abs(tlnX - pcx), Math.abs(tlnZ - pcz)) > ringR;
+    }
+
     private void drawTopLevelColumns(GuiGraphicsExtractor extractor) {
         LongOpenHashSet columns = ActiveTopLevelTracker.INSTANCE.getColumns();
         int halfW = this.width >> 1;
@@ -700,6 +848,11 @@ public class MapScreen extends Screen {
             int tlnZ = ActiveTopLevelTracker.columnZ(packed);
             // The render ring is only a coverage range; show columns that have usable data on disk
             if (!this.cacheIndex.containsColumn(tlnX, tlnZ)) {
+                continue;
+            }
+            // Skip columns outside the current ring: after a view distance shrink voxy drains
+            // removals incrementally, so the tracker still lists old columns for a moment
+            if (this.outsideRing(tlnX, tlnZ)) {
                 continue;
             }
             this.visibleActiveCount++;
@@ -858,28 +1011,18 @@ public class MapScreen extends Screen {
         return new int[] {cX1, cZ1, cX2, cZ2};
     }
 
-    /** Screen rect of the voxy render ring [x1, z1, x2, z2); null when there is no ring. */
+    /** Screen rect of the voxy render ring [x1, z1, x2, z2), centered on the player at the current radius; null when unavailable. */
     private int[] ringScreenRect(int halfW, int halfH, int z) {
-        LongOpenHashSet ring = ActiveTopLevelTracker.INSTANCE.getRingColumns();
-        if (ring.isEmpty()) {
+        int ringR = this.ringRadiusColumns();
+        if (ringR < 0) {
             return null;
         }
-        int minX = Integer.MAX_VALUE;
-        int minZ = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE;
-        int maxZ = Integer.MIN_VALUE;
-        LongIterator it = ring.iterator();
-        while (it.hasNext()) {
-            long packed = it.nextLong();
-            minX = Math.min(minX, ActiveTopLevelTracker.columnX(packed));
-            maxX = Math.max(maxX, ActiveTopLevelTracker.columnX(packed));
-            minZ = Math.min(minZ, ActiveTopLevelTracker.columnZ(packed));
-            maxZ = Math.max(maxZ, ActiveTopLevelTracker.columnZ(packed));
-        }
-        int x1 = (int) Math.floor((minX - this.centerTlnX) * z + halfW);
-        int z1 = (int) Math.floor((minZ - this.centerTlnZ) * z + halfH);
-        int x2 = (int) Math.ceil(((maxX + 1.0) - this.centerTlnX) * z + halfW);
-        int z2 = (int) Math.ceil(((maxZ + 1.0) - this.centerTlnZ) * z + halfH);
+        int pcx = (int) Math.floor(this.mc.player.getX() / 512.0);
+        int pcz = (int) Math.floor(this.mc.player.getZ() / 512.0);
+        int x1 = (int) Math.floor((pcx - ringR - this.centerTlnX) * z + halfW);
+        int z1 = (int) Math.floor((pcz - ringR - this.centerTlnZ) * z + halfH);
+        int x2 = (int) Math.ceil(((pcx + ringR + 1.0) - this.centerTlnX) * z + halfW);
+        int z2 = (int) Math.ceil(((pcz + ringR + 1.0) - this.centerTlnZ) * z + halfH);
         int cX1 = Math.max(0, Math.min(x1, x2));
         int cX2 = Math.min(this.width, Math.max(x1, x2));
         int cZ1 = Math.max(0, Math.min(z1, z2));
@@ -960,10 +1103,27 @@ public class MapScreen extends Screen {
         if (player == null) {
             return;
         }
+        double px = player.getX();
+        double pz = player.getZ();
+        if (LodMapRenderer.INSTANCE.isCacheOnly()) {
+            // Previewing another dimension: no arrow, except the nether<->overworld cross view,
+            // where the position is converted (overworld 8 = nether 1)
+            String current = this.currentDimId();
+            String viewed = MapCache.INSTANCE.getDimension();
+            if ("minecraft_the_nether".equals(current) && "minecraft_overworld".equals(viewed)) {
+                px *= 8;
+                pz *= 8;
+            } else if ("minecraft_overworld".equals(current) && "minecraft_the_nether".equals(viewed)) {
+                px /= 8;
+                pz /= 8;
+            } else {
+                return;
+            }
+        }
         int halfW = this.width >> 1;
         int halfH = this.height >> 1;
-        int sx = (int) Math.floor((player.getX() / 512.0 - this.centerTlnX) * this.zoom + halfW);
-        int sy = (int) Math.floor((player.getZ() / 512.0 - this.centerTlnZ) * this.zoom + halfH);
+        int sx = (int) Math.floor((px / 512.0 - this.centerTlnX) * this.zoom + halfW);
+        int sy = (int) Math.floor((pz / 512.0 - this.centerTlnZ) * this.zoom + halfH);
         if (sx < -20 || sy < -20 || sx > this.width + 20 || sy > this.height + 20) {
             return;
         }
@@ -971,13 +1131,23 @@ public class MapScreen extends Screen {
         PlayerArrowIcon.render(extractor, sx, sy, player.getYRot());
     }
 
+    /** Sanitized dimension id of the current world, e.g. "minecraft_the_nether". */
+    private String currentDimId() {
+        Level level = this.mc.level;
+        if (level == null) {
+            return null;
+        }
+        return level.dimension().identifier().toString().replace(':', '_');
+    }
+
     private void drawButtons(GuiGraphicsExtractor extractor, int mouseX, int mouseY) {
-        for (ButtonZone b : this.buttons) {
+        for (int i = 0; i < this.buttons.size(); i++) {
+            ButtonZone b = this.buttons.get(i);
             boolean hovered = b.contains(mouseX, mouseY);
             extractor.fill(b.x, b.y, b.x + b.w, b.y + b.h, hovered ? 0xFF3A3A48 : 0xFF2A2A35);
             outlineRect(extractor, b.x, b.y, b.x + b.w, b.y + b.h, 0xFF4A4A5A);
-            extractor.text(this.mc.font, Component.translatable(b.label),
-                    b.x + 4, b.y + (b.h - 8) / 2, 0xFFCCCCCC, false);
+            Component text = i == DIM_BUTTON_INDEX ? this.dimLabelComponent() : Component.translatable(b.label);
+            extractor.text(this.mc.font, text, b.x + 4, b.y + (b.h - 8) / 2, 0xFFCCCCCC, false);
         }
     }
 
@@ -1333,7 +1503,7 @@ public class MapScreen extends Screen {
             return true;
         }
         if (key == GLFW.GLFW_KEY_R) {
-            this.requestScan();
+            this.rescanSelection();
             return true;
         }
         if (key == GLFW.GLFW_KEY_H || key == GLFW.GLFW_KEY_HOME) {
