@@ -4,10 +4,17 @@
   "package": "dev.whisperlyric.voxyrenderfilter.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "AsyncNodeManagerAccessor",
     "RenderDistanceTrackerMixin",
+    "RenderGenerationServiceMixin",
     "GuiMixin",
     "SectionSerializationStorageAccessor",
-    "VoxyInstanceAccessor"
+    "SectionSavingServiceAccessor",
+    "VoxelIngestServiceAccessor",
+    "VoxyClientInstanceIngestMixin",
+    "VoxyInstanceAccessor",
+    "VoxyInstanceIngestMixin",
+    "VoxyRenderSystemAccessor"
   ],
   "injectors": {
   }

@@ -1,7 +1,8 @@
 package dev.whisperlyric.voxyrenderfilter.filter;
 
 /**
- * 不可变矩形，坐标单位为 TLN 列（lvl4 section 坐标，即方块坐标 >> 9）。
+ * Immutable rectangle with coordinates in TLN columns (lvl4 section coordinates,
+ * i.e. block coordinates >> 9).
  */
 public record RectFilter(int minX, int minZ, int maxX, int maxZ) {
 

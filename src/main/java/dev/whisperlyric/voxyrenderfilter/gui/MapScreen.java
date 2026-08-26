@@ -3,12 +3,16 @@ package dev.whisperlyric.voxyrenderfilter.gui;
 import dev.whisperlyric.voxyrenderfilter.filter.RectFilter;
 import dev.whisperlyric.voxyrenderfilter.filter.RenderFilterState;
 import dev.whisperlyric.voxyrenderfilter.index.CacheCoverageIndex;
+import dev.whisperlyric.voxyrenderfilter.map.LodMapRenderer;
 import dev.whisperlyric.voxyrenderfilter.purge.CachePurgeService;
+import dev.whisperlyric.voxyrenderfilter.purge.RenderNodeRefresh;
 import dev.whisperlyric.voxyrenderfilter.tracker.ActiveTopLevelTracker;
 import dev.whisperlyric.voxyrenderfilter.util.VoxyAccess;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import me.cortex.voxy.common.world.WorldEngine;
+import me.cortex.voxy.common.world.service.VoxelIngestService;
+import me.cortex.voxy.commonImpl.WorldIdentifier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -16,35 +20,47 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.world.level.Level;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 缓存地图（小地图风格，类似 FTB Chunks / Xaero）：
- * <ul>
- *   <li>淡色 = 此世界磁盘中已缓存的 LOD 区块（后台扫描存储文件，按 TLN 列 512×512 方块聚合）</li>
- *   <li>绿色 = voxy 当前 LOD 渲染中的顶层区块（实时，随视野移动更新）</li>
- *   <li>左键拖拽框选、右键取消、滚轮缩放（以光标为中心）、WASD/方向键平移</li>
- *   <li>缩放可到单区块级别（最大 4096px / TLN 列 = 128px / chunk）；选区始终按 chunk(16 方块) 粒度吸附</li>
- *   <li>选区显示方块/chunk/region 尺寸；放大后选区内叠加 chunk 网格线</li>
- * </ul>
+ * Cache map (minimap style, like FTB Chunks / Xaero):
+ * - light blue: LOD data cached on disk for this world (aggregated per TLN column, 512x512 blocks)
+ * - green: columns in the current render ring that have usable LOD data on disk
+ * Drag to select, right-click a selection for a context menu (block / allow-only / invert / purge),
+ * right-click empty space to clear, scroll to zoom (centered on the cursor), WASD/arrows to pan.
+ * Selection snaps to region files (32x32 chunks) at low zoom and to lvl0 sections (2x2 chunks)
+ * once sections are visible. Ctrl toggles multi-select; Shift forces a square selection.
  */
 public class MapScreen extends Screen {
 
     private static final int MIN_ZOOM = 2;
-    /** 最大缩放：px / TLN 列（512 方块）。4096 = 每 chunk 128px，可看清单个区块。 */
+    /** Max zoom: px per TLN column (512 blocks); 4096 = 128px per chunk. */
     private static final int MAX_ZOOM = 4096;
-    /** 每次平移为当前可见宽度的比例（随缩放自适应）。 */
     private static final double PAN_FRACTION = 0.5;
-    /** 缩放达到该值（每 chunk ≥ 4px）时在选区内绘制 chunk 网格。 */
-    private static final int CHUNK_GRID_ZOOM = 128;
-    /** 选区内每轴最多绘制的 chunk 网格线数量，避免极端选区下每帧绘制过多线段。 */
+    /** Above this zoom (>= 2px per chunk) selection snaps to lvl0 sections (2x2 chunks). */
+    private static final int CHUNK_SELECT_ZOOM = 128;
+    /** Above this zoom (>= 4px per chunk) draw a chunk grid inside selections. */
+    private static final int CHUNK_GRID_ZOOM = 256;
+    /** Max chunk grid lines per axis per selection, keeps drawing cheap on huge selections. */
     private static final int CHUNK_GRID_MAX_LINES = 256;
-    /** 磁盘缓存列的淡色覆盖。 */
+    private static final int GRID_COLOR = 0x66FFFFFF;
+    private static final int TEXT_MAX_SELECTIONS = 6;
+    private static final String OVERLAY_LABEL_ON = "voxyrenderfilter.map.button.overlay.on";
+    private static final String OVERLAY_LABEL_OFF = "voxyrenderfilter.map.button.overlay.off";
+    /** Index of the overlay toggle in the button column (last). */
+    private static final int OVERLAY_BUTTON_INDEX = 5;
     private static final int CACHED_COLOR = 0x50A0B8C8;
+    private static final int ACTIVE_COLOR = 0x802F9E4F;
+    private static final int ACTIVE_BORDER_COLOR = 0x801B5E2F;
+    private static final int BLOCKED_COLOR = 0x60FF8C00;
+    /** Faint orange over the whole blocked rect, also visible on uncached terrain. */
+    private static final int BLOCKED_RECT_COLOR = 0x30FF8C00;
 
     private record ButtonZone(int x, int y, int w, int h, String label, Runnable action) {
         boolean contains(double mx, double my) {
@@ -52,24 +68,51 @@ public class MapScreen extends Screen {
         }
     }
 
+    private record MenuEntry(String label, Runnable action) {
+    }
+
+    /** Selection: chunkRect in chunk coords; sectionUnit = snapped to lvl0 sections at high zoom. */
+    private record SelRect(RectFilter chunkRect, boolean sectionUnit) {
+    }
+
     private final Minecraft mc;
 
-    /** 视图中心，单位 = TLN 列（可带小数，即 512 方块粒度的连续坐标）。 */
+    /** View center in TLN column units (fractional = continuous 512-block coords). */
     private double centerTlnX;
     private double centerTlnZ;
     private int zoom = 8;
 
-    /** 选区，单位 = chunk（16 方块），min/max 均为 chunk 序号（含端点）。 */
-    private RectFilter selection;
+    private final List<SelRect> selections = new ArrayList<>();
+    private boolean multiSelect;
+    private boolean dragging;
+    private boolean selSectionUnit;
     private int selAnchorX;
     private int selAnchorZ;
-    private boolean dragging;
+    private boolean rightDragging;
+    private boolean rightSelSectionUnit;
+    private int rightAnchorX;
+    private int rightAnchorZ;
+    private int rightCurX;
+    private int rightCurZ;
 
     private volatile int purgeState;      // 0 idle, 1 running, 2 finished
     private volatile String purgeResult = "";
 
+    private boolean menuOpen;
+    private int menuX;
+    private int menuY;
+    private int menuW;
+    private int menuH;
+    private final List<MenuEntry> menuItems = new ArrayList<>();
+    /** Last frame's hovered menu item index, -1 = none (set while rendering, used on click). */
+    private int hoveredMenu = -1;
+
     private final CacheCoverageIndex cacheIndex = new CacheCoverageIndex(null);
     private final List<ButtonZone> buttons = new ArrayList<>();
+    /** Green columns drawn last frame (disk-backed only). */
+    private int visibleActiveCount;
+    /** Whether the color overlays (cached / active / blocked) are drawn, toggled by the top-right button. */
+    private boolean showOverlays = true;
 
     public MapScreen() {
         super(Component.translatable("voxyrenderfilter.map.title"));
@@ -81,44 +124,199 @@ public class MapScreen extends Screen {
         this.centerOnPlayer();
         this.requestScan();
         this.buttons.clear();
-        int x = this.width - 112;
-        this.buttons.add(new ButtonZone(x, 4, 108, 18, "voxyrenderfilter.map.button.filter", this::applySelectionToFilter));
-        this.buttons.add(new ButtonZone(x, 26, 108, 18, "voxyrenderfilter.map.button.purge", this::purgeSelection));
-        this.buttons.add(new ButtonZone(x, 48, 108, 18, "voxyrenderfilter.map.button.clear", this::clearSelection));
-        this.buttons.add(new ButtonZone(x, 70, 108, 18, "voxyrenderfilter.map.button.rescan", this::requestScan));
-        this.buttons.add(new ButtonZone(x, 92, 108, 18, "voxyrenderfilter.map.button.center", this::centerOnPlayer));
+        // Button width fits the widest label, right-aligned column
+        String[] labels = {
+                "voxyrenderfilter.map.button.clearfilter",
+                "voxyrenderfilter.map.button.purge",
+                "voxyrenderfilter.map.button.clear",
+                "voxyrenderfilter.map.button.rescan",
+                "voxyrenderfilter.map.button.center",
+                this.overlayLabel()
+        };
+        List<Runnable> actions = List.of(
+                this::clearFilter,
+                this::purgeSelection,
+                this::clearSelection,
+                this::requestScan,
+                this::centerOnPlayer,
+                this::toggleOverlays);
+        int maxW = 0;
+        for (String label : labels) {
+            maxW = Math.max(maxW, this.mc.font.width(Component.translatable(label)));
+        }
+        // The toggle label changes; reserve the wider of the two states so the button does not resize
+        maxW = Math.max(maxW, this.mc.font.width(Component.translatable(OVERLAY_LABEL_ON)));
+        maxW = Math.max(maxW, this.mc.font.width(Component.translatable(OVERLAY_LABEL_OFF)));
+        int w = maxW + 14;
+        int x = this.width - w - 4;
+        int y = 4;
+        for (int i = 0; i < labels.length; i++) {
+            this.buttons.add(new ButtonZone(x, y, w, 18, labels[i], actions.get(i)));
+            y += 22;
+        }
     }
 
     private void requestScan() {
-        this.cacheIndex.requestScan(VoxyAccess.getCurrentEngine());
+        // Force a disk rescan (ignores an in-flight scan) and invalidate the terrain texture;
+        // the render thread rescans all LOD levels on disk and rebuilds next frame
+        this.cacheIndex.requestScan(VoxyAccess.getCurrentEngine(), true);
+        LodMapRenderer.INSTANCE.invalidate();
     }
 
     private void centerOnPlayer() {
         LocalPlayer player = this.mc.player;
         if (player != null) {
-            // 用精确的小数坐标使玩家标记始终位于屏幕中心
+            // Fractional coords keep the player marker exactly centered
             this.centerTlnX = player.getX() / 512.0;
             this.centerTlnZ = player.getZ() / 512.0;
         }
     }
 
     private void clearSelection() {
-        this.selection = null;
+        this.selections.clear();
     }
 
-    /** 选区（chunk 坐标）-> 方块坐标 -> 渲染过滤（自动转为 TLN 列）。 */
-    private void applySelectionToFilter() {
-        if (this.selection == null) {
+    /** Translation key of the current overlay toggle state. */
+    private String overlayLabel() {
+        return this.showOverlays ? OVERLAY_LABEL_ON : OVERLAY_LABEL_OFF;
+    }
+
+    /** Toggles the color overlays (cached / active / blocked) and refreshes the button label. */
+    private void toggleOverlays() {
+        this.showOverlays = !this.showOverlays;
+        if (OVERLAY_BUTTON_INDEX < this.buttons.size()) {
+            ButtonZone b = this.buttons.get(OVERLAY_BUTTON_INDEX);
+            this.buttons.set(OVERLAY_BUTTON_INDEX,
+                    new ButtonZone(b.x(), b.y(), b.w(), b.h(), this.overlayLabel(), this::toggleOverlays));
+        }
+    }
+
+    /** Clears the render filter: restores rendering of all TLN columns. */
+    private void clearFilter() {
+        RenderFilterState.INSTANCE.clear();
+        // Rebuild the nodes removed by the filter right away, no voxy disable/enable needed
+        RenderNodeRefresh.clearFilterImmediately();
+        this.purgeResult = "filtercleared";
+    }
+
+    /** Applies all selections (chunk coords -> lvl0 section coords) to the render filter with the given mode. */
+    private void applyFilterToSelections(RenderFilterState.Mode mode) {
+        if (this.selections.isEmpty()) {
             return;
         }
-        RenderFilterState.INSTANCE.setRect(
-                this.selection.minX() << 4, this.selection.minZ() << 4,
-                ((this.selection.maxX() + 1) << 4) - 1, ((this.selection.maxZ() + 1) << 4) - 1);
-        this.mc.setScreen(null);
+        List<RectFilter> sectionRects = new ArrayList<>();
+        for (SelRect sel : this.selections) {
+            sectionRects.add(this.selectionSectionRect(sel.chunkRect()));
+        }
+        RenderFilterState.INSTANCE.setRects(sectionRects, mode);
+        // Sync render nodes immediately: restore columns the old filter removed, then remove/rebuild the newly blocked ones
+        RenderNodeRefresh.clearFilterImmediately();
+        RenderNodeRefresh.applyFilterImmediately();
+    }
+
+    /** Converts a chunk-coord selection to a closed lvl0 section rect (chunk >> 1). */
+    private RectFilter selectionSectionRect(RectFilter chunkRect) {
+        int x1 = chunkRect.minX() >> 1;
+        int z1 = chunkRect.minZ() >> 1;
+        int x2 = chunkRect.maxX() >> 1;
+        int z2 = chunkRect.maxZ() >> 1;
+        return new RectFilter(Math.min(x1, x2), Math.min(z1, z2), Math.max(x1, x2), Math.max(z1, z2));
+    }
+
+    /**
+     * Unblocks the selection (section coords): in BLOCK mode the rect is subtracted from the filter
+     * (cleared when nothing is left); in ALLOW mode the rect is added back to the allow rect.
+     */
+    private void unblockSelection() {
+        RenderFilterState state = RenderFilterState.INSTANCE;
+        for (SelRect sel : this.selections) {
+            RectFilter sectionRect = this.selectionSectionRect(sel.chunkRect());
+            if (state.getMode() == RenderFilterState.Mode.BLOCK) {
+                state.removeRect(sectionRect);
+            } else {
+                state.addRect(sectionRect);
+            }
+        }
+        // Restore columns the previous filter removed, then remove/rebuild the newly affected ones
+        RenderNodeRefresh.clearFilterImmediately();
+        RenderNodeRefresh.applyFilterImmediately();
+    }
+
+    /**
+     * Inverts the filter: with no filter, applies allow-only to the selection;
+     * with an existing filter, toggles its polarity (block <-> allow), keeping the rects.
+     */
+    private void invertFilter() {
+        if (!RenderFilterState.INSTANCE.isEnabled()) {
+            this.applyFilterToSelections(RenderFilterState.Mode.ALLOW);
+            return;
+        }
+        RenderFilterState.INSTANCE.toggleMode();
+        RenderNodeRefresh.clearFilterImmediately();
+        RenderNodeRefresh.applyFilterImmediately();
+    }
+
+    /** Enter shortcut: blocks rendering of the selection (same as the first context menu item). */
+    private void applySelectionToFilter() {
+        this.applyFilterToSelections(RenderFilterState.Mode.BLOCK);
+    }
+
+    // Right-click context menu
+
+    private void openContextMenu(int mx, int my) {
+        if (this.selections.isEmpty()) {
+            return;
+        }
+        this.menuItems.clear();
+        RenderFilterState state = RenderFilterState.INSTANCE;
+        // When every selection is fully blocked, the first item becomes "unblock" instead
+        boolean fullyBlocked = true;
+        for (SelRect sel : this.selections) {
+            if (!state.isRectFullyBlocked(this.selectionSectionRect(sel.chunkRect()))) {
+                fullyBlocked = false;
+                break;
+            }
+        }
+        this.menuItems.add(new MenuEntry(fullyBlocked
+                        ? "voxyrenderfilter.map.menu.unblock"
+                        : "voxyrenderfilter.map.menu.block",
+                fullyBlocked ? this::unblockSelection
+                        : () -> this.applyFilterToSelections(RenderFilterState.Mode.BLOCK)));
+        this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.allow",
+                () -> this.applyFilterToSelections(RenderFilterState.Mode.ALLOW)));
+        this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.invert", this::invertFilter));
+        this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.purge", this::purgeSelection));
+        this.menuItems.add(new MenuEntry("voxyrenderfilter.map.menu.clear", this::clearSelection));
+        // Size the menu to its content: width = widest label + padding, height = items + separator
+        int itemH = 16;
+        int pad = 2;
+        int textW = 0;
+        for (MenuEntry e : this.menuItems) {
+            textW = Math.max(textW, this.mc.font.width(Component.translatable(e.label)));
+        }
+        this.menuW = textW + 18;
+        this.menuH = pad * 2 + this.menuItems.size() * itemH + 1;
+        // Open at the cursor, flipping inward when it would leave the screen
+        this.menuX = Math.max(2, mx + this.menuW > this.width - 2 ? mx - this.menuW : mx);
+        this.menuY = Math.max(2, my + this.menuH > this.height - 2 ? my - this.menuH : my);
+        this.menuOpen = true;
+    }
+
+    /** Index of the selection under the cursor (chunk coords), -1 if none. */
+    private int selectionAt(int mx, int my) {
+        int cx = this.screenToChunkX(mx);
+        int cz = this.screenToChunkZ(my);
+        for (int i = 0; i < this.selections.size(); i++) {
+            RectFilter r = this.selections.get(i).chunkRect();
+            if (r.minX() <= cx && cx <= r.maxX() && r.minZ() <= cz && cz <= r.maxZ()) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private void purgeSelection() {
-        if (this.selection == null || this.purgeState == 1) {
+        if (this.selections.isEmpty() || this.purgeState == 1) {
             return;
         }
         WorldEngine engine = VoxyAccess.getCurrentEngine();
@@ -127,22 +325,96 @@ public class MapScreen extends Screen {
             this.purgeState = 2;
             return;
         }
-        // 删除粒度受限于 TLN 列（region 文件），chunk 选区 -> 覆盖到的列区间
-        RectFilter tlnRect = new RectFilter(
-                this.selection.minX() >> 5, this.selection.minZ() >> 5,
-                this.selection.maxX() >> 5, this.selection.maxZ() >> 5);
+        // Delete all LOD levels covered by the selection: a coarse LOD section (lvl1-4) spans a larger
+        // area that includes the selection, so it must be removed too or the deleted data renders again.
+        List<RectFilter> chunkRects = new ArrayList<>();
+        List<RectFilter> blockRects = new ArrayList<>();
+        for (SelRect sel : this.selections) {
+            RectFilter r = sel.chunkRect();
+            chunkRects.add(r);
+            blockRects.add(new RectFilter(r.minX() << 4, r.minZ() << 4,
+                    ((r.maxX() + 1) << 4) - 1, ((r.maxZ() + 1) << 4) - 1));
+        }
         this.purgeState = 1;
-        CachePurgeService.purge(engine, tlnRect, count -> {
+        CachePurgeService.purge(engine, blockRects, count -> {
             this.purgeResult = String.valueOf(count);
             this.purgeState = 2;
-            // 磁盘变化后重新扫描，刷新淡色覆盖层
-            this.requestScan();
+            // Re-ingest neighbor chunks wrongly deleted (inside the lvl0 section, loaded, outside the selection)
+            this.restorePurgedNeighbors(chunkRects);
+            if (count > 0) {
+                // Remove the affected columns' render nodes now (otherwise stale LOD renders until voxy
+                // reloads) and rebuild them delayed from the current disk/memory state
+                RenderNodeRefresh.refreshForBlockRects(blockRects);
+                // The terrain texture holds stale data; invalidate it so the render thread rebuilds from disk
+                this.mc.execute(LodMapRenderer.INSTANCE::invalidate);
+            }
+            // Force a rescan of the disk coverage overlay (ignores an in-flight scan)
+            this.cacheIndex.requestScan(VoxyAccess.getCurrentEngine(), true);
         });
     }
 
-    //===================================================================================
-    // 渲染
-    //===================================================================================
+    /**
+     * A deleted lvl0 section covers 2x2 chunks; chunks outside the selection were deleted by mistake.
+     * They cannot be restored from nothing, so re-ingest the loaded ones from the live world (with
+     * lighting, full detail, rebuilding coarse LODs upward). Unloaded neighbors regenerate on their
+     * own when voxy loads them. World chunks are read on the render thread via {@link Minecraft#execute}.
+     */
+    private void restorePurgedNeighbors(List<RectFilter> chunkRects) {
+        LongOpenHashSet targets = new LongOpenHashSet();
+        for (RectFilter s : chunkRects) {
+            // chunk -> lvl0 section (chunk >> 1); a section covers chunks [sec*2, sec*2+2)
+            for (int secX = s.minX() >> 1; secX <= s.maxX() >> 1; secX++) {
+                for (int secZ = s.minZ() >> 1; secZ <= s.maxZ() >> 1; secZ++) {
+                    for (int cx = secX << 1; cx <= (secX << 1) + 1; cx++) {
+                        for (int cz = secZ << 1; cz <= (secZ << 1) + 1; cz++) {
+                            if (!inAnyRect(chunkRects, cx, cz)) {
+                                targets.add(((long) cx << 32) | (cz & 0xFFFFFFFFL));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (targets.isEmpty()) {
+            return;
+        }
+        this.mc.execute(() -> {
+            Level level = this.mc.level;
+            if (level == null) {
+                return;
+            }
+            WorldIdentifier id = WorldIdentifier.of(level);
+            if (id == null) {
+                return;
+            }
+            LongIterator it = targets.iterator();
+            while (it.hasNext()) {
+                long packed = it.nextLong();
+                int cx = (int) (packed >> 32);
+                int cz = (int) packed;
+                // Only re-ingest loaded chunks; unloaded ones regenerate when voxy loads them
+                if (!level.isLoaded(new BlockPos(cx << 4, 0, cz << 4))) {
+                    continue;
+                }
+                try {
+                    VoxelIngestService.tryIngestChunk(id, level.getChunk(cx, cz));
+                } catch (Exception ignored) {
+                    // Engine may be switching; a failed restore is acceptable
+                }
+            }
+        });
+    }
+
+    private static boolean inAnyRect(List<RectFilter> rects, int cx, int cz) {
+        for (RectFilter r : rects) {
+            if (r.minX() <= cx && cx <= r.maxX() && r.minZ() <= cz && cz <= r.maxZ()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Rendering
 
     @Override
     public void extractRenderState(GuiGraphicsExtractor extractor, int mouseX, int mouseY, float partialTick) {
@@ -151,31 +423,75 @@ public class MapScreen extends Screen {
         }
         extractor.fill(0, 0, this.width, this.height, 0xFF15151D);
 
-        this.drawCachedColumns(extractor);
-        this.drawTopLevelColumns(extractor);
+        // Real LOD terrain map: request the visible columns and draw (bottom layer)
+        LodMapRenderer.INSTANCE.update(extractor, VoxyAccess.getCurrentEngine(),
+                this.centerTlnX, this.centerTlnZ, this.zoom, this.width, this.height);
+        if (this.showOverlays) {
+            this.drawCachedColumns(extractor);
+            this.drawTopLevelColumns(extractor);
+        }
         this.drawChunkGrid(extractor);
-        this.drawSelection(extractor);
+        this.drawSelections(extractor);
+        this.drawRightDragPreview(extractor);
+        if (this.showOverlays) {
+            this.drawFilterBlockOverlay(extractor);
+        }
         this.drawPlayer(extractor);
         this.drawButtons(extractor, mouseX, mouseY);
         this.drawText(extractor);
+        this.drawContextMenu(extractor, mouseX, mouseY);
     }
 
-    /** 磁盘中已缓存的 LOD 区块（此世界全部缓存），以淡色半透明覆盖显示。 */
+    /** Draws a faint translucent overlay of the disk LOD cache for this world (finest lvl0 sections only). */
     private void drawCachedColumns(GuiGraphicsExtractor extractor) {
+        int halfW = this.width >> 1;
+        int halfH = this.height >> 1;
+        int z = this.zoom;
+        if (z >= CHUNK_SELECT_ZOOM) {
+            // High zoom: one tile per lvl0 section (32x32 blocks), sized zoom/16 px
+            long[] sections = this.cacheIndex.getSections();
+            if (sections.length == 0) {
+                return;
+            }
+            int secPx = Math.max(1, z >> 4);
+            for (long packed : sections) {
+                int tlnX = (int) (packed >> 32) >> 4;
+                int tlnZ = (int) packed >> 4;
+                // Skip sections whose column already has a terrain texture, so the overlay does not hide it
+                if (LodMapRenderer.INSTANCE.hasUploaded(tlnX, tlnZ)) {
+                    continue;
+                }
+                int sx = (int) Math.floor(((packed >> 32) / 16.0 - this.centerTlnX) * z + halfW);
+                int sy = (int) Math.floor(((int) packed / 16.0 - this.centerTlnZ) * z + halfH);
+                if (sx + secPx < 0 || sy + secPx < 0 || sx > this.width || sy > this.height) {
+                    continue;
+                }
+                // Blocked sections show orange, cached ones light blue
+                extractor.fill(sx, sy, sx + secPx, sy + secPx,
+                        RenderFilterState.INSTANCE.isSectionBlocked((int) (packed >> 32), (int) packed)
+                                ? BLOCKED_COLOR : CACHED_COLOR);
+            }
+            return;
+        }
+        // Low zoom: one tile per TLN column (512x512 blocks)
         long[] columns = this.cacheIndex.getColumns();
         if (columns.length == 0) {
             return;
         }
-        int halfW = this.width >> 1;
-        int halfH = this.height >> 1;
-        int z = this.zoom;
         for (long packed : columns) {
-            int sx = (int) Math.floor(((packed >> 32) - this.centerTlnX) * z + halfW);
-            int sy = (int) Math.floor(((int) packed - this.centerTlnZ) * z + halfH);
+            int tlnX = (int) (packed >> 32);
+            int tlnZ = (int) packed;
+            // Skip columns already drawn by the terrain texture
+            if (LodMapRenderer.INSTANCE.hasUploaded(tlnX, tlnZ)) {
+                continue;
+            }
+            int sx = (int) Math.floor((tlnX - this.centerTlnX) * z + halfW);
+            int sy = (int) Math.floor((tlnZ - this.centerTlnZ) * z + halfH);
             if (sx + z < 0 || sy + z < 0 || sx > this.width || sy > this.height) {
                 continue;
             }
-            extractor.fill(sx, sy, sx + z, sy + z, CACHED_COLOR);
+            extractor.fill(sx, sy, sx + z, sy + z,
+                    RenderFilterState.INSTANCE.isColumnBlocked(tlnX, tlnZ) ? BLOCKED_COLOR : CACHED_COLOR);
         }
     }
 
@@ -185,59 +501,94 @@ public class MapScreen extends Screen {
         int halfH = this.height >> 1;
         int z = this.zoom;
         LongIterator it = columns.iterator();
+        this.visibleActiveCount = 0;
         while (it.hasNext()) {
             long packed = it.nextLong();
-            int sx = (int) Math.floor((ActiveTopLevelTracker.columnX(packed) - this.centerTlnX) * z + halfW);
-            int sy = (int) Math.floor((ActiveTopLevelTracker.columnZ(packed) - this.centerTlnZ) * z + halfH);
+            int tlnX = ActiveTopLevelTracker.columnX(packed);
+            int tlnZ = ActiveTopLevelTracker.columnZ(packed);
+            // The render ring is only a coverage range; show columns that have usable data on disk
+            if (!this.cacheIndex.containsColumn(tlnX, tlnZ)) {
+                continue;
+            }
+            this.visibleActiveCount++;
+            int sx = (int) Math.floor((tlnX - this.centerTlnX) * z + halfW);
+            int sy = (int) Math.floor((tlnZ - this.centerTlnZ) * z + halfH);
             if (sx + z < 0 || sy + z < 0 || sx > this.width || sy > this.height) {
                 continue;
             }
-            extractor.fill(sx, sy, sx + z, sy + z, 0xFF2F9E4F);
+            extractor.fill(sx, sy, sx + z, sy + z, ACTIVE_COLOR);
             if (z >= 4) {
-                extractor.fill(sx, sy, sx + 1, sy + z, 0xFF1B5E2F);
-                extractor.fill(sx, sy, sx + z, sy + 1, 0xFF1B5E2F);
+                extractor.fill(sx, sy, sx + 1, sy + z, ACTIVE_BORDER_COLOR);
+                extractor.fill(sx, sy, sx + z, sy + 1, ACTIVE_BORDER_COLOR);
             }
         }
     }
 
-    /** 选区内按 chunk 边界绘制网格线（1 TLN 列 = 32 chunks）。 */
+    /**
+     * Draws chunk (16x16 block) grid lines inside each selection. Lines always follow chunk
+     * boundaries regardless of the selection's creation granularity, so a region-file selection
+     * shows a 32x32 chunk grid when zoomed in.
+     */
     private void drawChunkGrid(GuiGraphicsExtractor extractor) {
-        if (this.selection == null || this.zoom < CHUNK_GRID_ZOOM) {
+        if (this.selections.isEmpty() || this.zoom < CHUNK_GRID_ZOOM) {
             return;
         }
-        int linesX = this.selection.maxX() - this.selection.minX() + 2;
-        int linesZ = this.selection.maxZ() - this.selection.minZ() + 2;
-        if (linesX > CHUNK_GRID_MAX_LINES || linesZ > CHUNK_GRID_MAX_LINES) {
+        for (SelRect sel : this.selections) {
+            RectFilter s = sel.chunkRect();
+            // Chunk boundary spacing: 1 chunk (16x16 blocks)
+            int step = 1;
+            int linesX = (s.maxX() - s.minX()) / step + 2;
+            int linesZ = (s.maxZ() - s.minZ()) / step + 2;
+            if (linesX > CHUNK_GRID_MAX_LINES || linesZ > CHUNK_GRID_MAX_LINES) {
+                continue;
+            }
+            int[] rect = this.selectionScreenRect(s);
+            if (rect == null) {
+                continue;
+            }
+            int z = this.zoom;
+            int halfW = this.width >> 1;
+            int halfH = this.height >> 1;
+            for (int cx = s.minX(); cx <= s.maxX() + 1; cx += step) {
+                int sx = (int) Math.floor((cx / 32.0 - this.centerTlnX) * z + halfW);
+                if (sx < 0 || sx > this.width) {
+                    continue;
+                }
+                extractor.fill(sx, rect[1], sx + 1, rect[3], GRID_COLOR);
+            }
+            for (int cz = s.minZ(); cz <= s.maxZ() + 1; cz += step) {
+                int sy = (int) Math.floor((cz / 32.0 - this.centerTlnZ) * z + halfH);
+                if (sy < 0 || sy > this.height) {
+                    continue;
+                }
+                extractor.fill(rect[0], sy, rect[2], sy + 1, GRID_COLOR);
+            }
+        }
+    }
+
+    private void drawSelections(GuiGraphicsExtractor extractor) {
+        for (SelRect sel : this.selections) {
+            this.drawSelection(extractor, sel.chunkRect());
+        }
+    }
+
+    /** Draws the in-progress right-drag cut (red border over a translucent red fill), the area subtracted on release. */
+    private void drawRightDragPreview(GuiGraphicsExtractor extractor) {
+        if (!this.rightDragging) {
             return;
         }
-        int[] rect = this.selectionScreenRect();
+        RectFilter r = this.makeSelectionRect(this.rightAnchorX, this.rightAnchorZ, this.rightCurX, this.rightCurZ,
+                this.rightSelSectionUnit);
+        int[] rect = this.selectionScreenRect(r);
         if (rect == null) {
             return;
         }
-        int z = this.zoom;
-        int halfW = this.width >> 1;
-        int halfH = this.height >> 1;
-        for (int cx = this.selection.minX(); cx <= this.selection.maxX() + 1; cx++) {
-            int sx = (int) Math.floor((cx / 32.0 - this.centerTlnX) * z + halfW);
-            if (sx < 0 || sx > this.width) {
-                continue;
-            }
-            extractor.fill(sx, rect[1], sx + 1, rect[3], 0xFF3A3A4A);
-        }
-        for (int cz = this.selection.minZ(); cz <= this.selection.maxZ() + 1; cz++) {
-            int sy = (int) Math.floor((cz / 32.0 - this.centerTlnZ) * z + halfH);
-            if (sy < 0 || sy > this.height) {
-                continue;
-            }
-            extractor.fill(rect[0], sy, rect[2], sy + 1, 0xFF3A3A4A);
-        }
+        extractor.fill(rect[0] + 1, rect[1] + 1, rect[2] - 1, rect[3] - 1, 0x30FF5555);
+        outlineRect(extractor, rect[0], rect[1], rect[2], rect[3], 0xFFFF5555);
     }
 
-    private void drawSelection(GuiGraphicsExtractor extractor) {
-        if (this.selection == null) {
-            return;
-        }
-        int[] rect = this.selectionScreenRect();
+    private void drawSelection(GuiGraphicsExtractor extractor, RectFilter s) {
+        int[] rect = this.selectionScreenRect(s);
         if (rect == null) {
             return;
         }
@@ -245,13 +596,171 @@ public class MapScreen extends Screen {
         int z1 = rect[1];
         int x2 = rect[2];
         int z2 = rect[3];
-        // 内部半透明
+        // Translucent interior
         extractor.fill(x1 + 1, z1 + 1, x2 - 1, z2 - 1, 0x2233AAFF);
-        // 四条 1px 边框（用 fill 明确坐标，避免 outline 的绘制语义问题）
+        // 1px border via four fills with explicit coords (outline's (x,y,w,h) semantics overshoot)
         extractor.fill(x1, z1, x2, z1 + 1, 0xFF33AAFF);
         extractor.fill(x1, z2 - 1, x2, z2, 0xFF33AAFF);
         extractor.fill(x1, z1, x1 + 1, z2, 0xFF33AAFF);
         extractor.fill(x2 - 1, z1, x2, z2, 0xFF33AAFF);
+    }
+
+    /**
+     * Marks the filtered-out area orange over everything else (uncached terrain included), so the
+     * filter scope is visible: inside the rects in BLOCK mode, outside them (screen minus the allow
+     * rects) in ALLOW mode. Filter rects are lvl0 sections (32 blocks), scaled as /16 TLN columns.
+     */
+    private void drawFilterBlockOverlay(GuiGraphicsExtractor extractor) {
+        RenderFilterState state = RenderFilterState.INSTANCE;
+        if (!state.isEnabled()) {
+            return;
+        }
+        int halfW = this.width >> 1;
+        int halfH = this.height >> 1;
+        int z = this.zoom;
+        if (state.getMode() == RenderFilterState.Mode.ALLOW) {
+            // Blocked = voxy ring coverage minus the allow rects. Stop at the ring boundary: columns
+            // outside it have no render nodes and must not be covered by the invert overlay
+            int[] view = this.ringScreenRect(halfW, halfH, z);
+            if (view == null) {
+                return;
+            }
+            List<int[]> blocked = new ArrayList<>();
+            blocked.add(view);
+            for (RectFilter f : state.getFilters()) {
+                int[] r = this.filterScreenRect(f, halfW, halfH, z);
+                if (r == null) {
+                    continue;
+                }
+                List<int[]> next = new ArrayList<>();
+                subtractScreenRects(blocked, r, next);
+                blocked = next;
+            }
+            for (int[] r : blocked) {
+                extractor.fill(r[0], r[1], r[2], r[3], BLOCKED_RECT_COLOR);
+            }
+            return;
+        }
+        for (RectFilter f : state.getFilters()) {
+            int[] r = this.filterScreenRect(f, halfW, halfH, z);
+            if (r == null) {
+                continue;
+            }
+            extractor.fill(r[0], r[1], r[2], r[3], BLOCKED_RECT_COLOR);
+        }
+    }
+
+    /** Screen rect [x1, z1, x2, z2) (half-open) of a filter rect (section coords), clipped; null when off-screen. */
+    private int[] filterScreenRect(RectFilter f, int halfW, int halfH, int z) {
+        int x1 = (int) Math.floor((f.minX() / 16.0 - this.centerTlnX) * z + halfW);
+        int z1 = (int) Math.floor((f.minZ() / 16.0 - this.centerTlnZ) * z + halfH);
+        int x2 = (int) Math.ceil(((f.maxX() + 1.0) / 16.0 - this.centerTlnX) * z + halfW);
+        int z2 = (int) Math.ceil(((f.maxZ() + 1.0) / 16.0 - this.centerTlnZ) * z + halfH);
+        int cX1 = Math.max(0, Math.min(x1, x2));
+        int cX2 = Math.min(this.width, Math.max(x1, x2));
+        int cZ1 = Math.max(0, Math.min(z1, z2));
+        int cZ2 = Math.min(this.height, Math.max(z1, z2));
+        if (cX2 - cX1 < 1 || cZ2 - cZ1 < 1) {
+            return null;
+        }
+        return new int[] {cX1, cZ1, cX2, cZ2};
+    }
+
+    /** Screen rect of the voxy render ring [x1, z1, x2, z2); null when there is no ring. */
+    private int[] ringScreenRect(int halfW, int halfH, int z) {
+        LongOpenHashSet ring = ActiveTopLevelTracker.INSTANCE.getRingColumns();
+        if (ring.isEmpty()) {
+            return null;
+        }
+        int minX = Integer.MAX_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int maxZ = Integer.MIN_VALUE;
+        LongIterator it = ring.iterator();
+        while (it.hasNext()) {
+            long packed = it.nextLong();
+            minX = Math.min(minX, ActiveTopLevelTracker.columnX(packed));
+            maxX = Math.max(maxX, ActiveTopLevelTracker.columnX(packed));
+            minZ = Math.min(minZ, ActiveTopLevelTracker.columnZ(packed));
+            maxZ = Math.max(maxZ, ActiveTopLevelTracker.columnZ(packed));
+        }
+        int x1 = (int) Math.floor((minX - this.centerTlnX) * z + halfW);
+        int z1 = (int) Math.floor((minZ - this.centerTlnZ) * z + halfH);
+        int x2 = (int) Math.ceil(((maxX + 1.0) - this.centerTlnX) * z + halfW);
+        int z2 = (int) Math.ceil(((maxZ + 1.0) - this.centerTlnZ) * z + halfH);
+        int cX1 = Math.max(0, Math.min(x1, x2));
+        int cX2 = Math.min(this.width, Math.max(x1, x2));
+        int cZ1 = Math.max(0, Math.min(z1, z2));
+        int cZ2 = Math.min(this.height, Math.max(z1, z2));
+        if (cX2 - cX1 < 1 || cZ2 - cZ1 < 1) {
+            return null;
+        }
+        return new int[] {cX1, cZ1, cX2, cZ2};
+    }
+
+    /** Screen rect subtraction (half-open): each piece minus b; non-empty results append to out. */
+    private static void subtractScreenRects(List<int[]> pieces, int[] b, List<int[]> out) {
+        int bx1 = b[0];
+        int bz1 = b[1];
+        int bx2 = b[2];
+        int bz2 = b[3];
+        for (int[] p : pieces) {
+            int ax1 = p[0];
+            int az1 = p[1];
+            int ax2 = p[2];
+            int az2 = p[3];
+            if (ax2 <= bx1 || bx2 <= ax1 || az2 <= bz1 || bz2 <= az1) {
+                out.add(p);
+                continue;
+            }
+            if (ax1 < bx1) {
+                out.add(new int[] {ax1, az1, bx1, az2});
+            }
+            if (bx2 < ax2) {
+                out.add(new int[] {bx2, az1, ax2, az2});
+            }
+            int cx1 = Math.max(ax1, bx1);
+            int cx2 = Math.min(ax2, bx2);
+            if (az1 < bz1) {
+                out.add(new int[] {cx1, az1, cx2, bz1});
+            }
+            if (bz2 < az2) {
+                out.add(new int[] {cx1, bz2, cx2, az2});
+            }
+        }
+    }
+
+    /** Draws the context menu (dark panel, hover highlight, separator) near the cursor. */
+    private void drawContextMenu(GuiGraphicsExtractor extractor, int mouseX, int mouseY) {
+        if (!this.menuOpen) {
+            return;
+        }
+        this.hoveredMenu = -1;
+        int itemH = 16;
+        int pad = 2;
+        extractor.fill(this.menuX, this.menuY, this.menuX + this.menuW, this.menuY + this.menuH, 0xEE1E1E28);
+        outlineRect(extractor, this.menuX, this.menuY,
+                this.menuX + this.menuW, this.menuY + this.menuH, 0xFF4A4A5A);
+        int y = this.menuY + pad;
+        for (int i = 0; i < this.menuItems.size(); i++) {
+            if (i == 3) {
+                // Separator after the invert item
+                extractor.fill(this.menuX + 4, y, this.menuX + this.menuW - 4, y + 1, 0xFF4A4A5A);
+                y += 1;
+            }
+            MenuEntry e = this.menuItems.get(i);
+            boolean hovered = mouseX >= this.menuX + 2 && mouseX < this.menuX + this.menuW - 2
+                    && mouseY >= y && mouseY < y + itemH;
+            if (hovered) {
+                this.hoveredMenu = i;
+                // Hovered item: background + left highlight bar (colors must be 8-bit ARGB on 26.x)
+                extractor.fill(this.menuX + 2, y, this.menuX + this.menuW - 2, y + itemH, 0xFF3A3A48);
+                extractor.fill(this.menuX + 2, y, this.menuX + 3, y + itemH, 0xFF33AAFF);
+            }
+            extractor.text(this.mc.font, Component.translatable(e.label),
+                    this.menuX + 8, y + (itemH - 8) / 2, hovered ? 0xFFFFFFFF : 0xFFCCCCCC, false);
+            y += itemH;
+        }
     }
 
     private void drawPlayer(GuiGraphicsExtractor extractor) {
@@ -259,37 +768,33 @@ public class MapScreen extends Screen {
         if (player == null) {
             return;
         }
-        int z = this.zoom;
         int halfW = this.width >> 1;
         int halfH = this.height >> 1;
-        int sx = (int) Math.round((player.getX() / 512.0 - this.centerTlnX) * z + halfW);
-        int sy = (int) Math.round((player.getZ() / 512.0 - this.centerTlnZ) * z + halfH);
-        if (sx < -8 || sx > this.width + 8 || sy < -8 || sy > this.height + 8) {
+        int sx = (int) Math.floor((player.getX() / 512.0 - this.centerTlnX) * this.zoom + halfW);
+        int sy = (int) Math.floor((player.getZ() / 512.0 - this.centerTlnZ) * this.zoom + halfH);
+        if (sx < -20 || sy < -20 || sx > this.width + 20 || sy > this.height + 20) {
             return;
         }
-        // 玩家标记（白色 3x3，中心黑点）
-        extractor.fill(sx - 1, sy - 1, sx + 2, sy + 2, 0xFFFFFFFF);
-        extractor.fill(sx, sy, sx + 1, sy + 1, 0xFF000000);
-        // 朝向箭头（沿 yaw 方向延伸）
-        double yawRad = Math.toRadians(player.getYRot());
-        double dx = -Math.sin(yawRad);
-        double dz = Math.cos(yawRad);
-        int len = Math.max(4, z / 2);
-        for (int i = 3; i <= len; i++) {
-            int px = sx + (int) Math.round(dx * i);
-            int py = sy + (int) Math.round(dz * i);
-            extractor.fill(px, py, px + 1, py + 1, 0xFFFFFFFF);
-        }
+        // FTB-Chunks style: fixed-size white arrow pointing along the player's yaw
+        PlayerArrowIcon.render(extractor, sx, sy, player.getYRot());
     }
 
     private void drawButtons(GuiGraphicsExtractor extractor, int mouseX, int mouseY) {
         for (ButtonZone b : this.buttons) {
             boolean hovered = b.contains(mouseX, mouseY);
             extractor.fill(b.x, b.y, b.x + b.w, b.y + b.h, hovered ? 0xFF3A3A48 : 0xFF2A2A35);
-            extractor.outline(b.x, b.y, b.x + b.w, b.y + b.h, 0xFF4A4A5A);
+            outlineRect(extractor, b.x, b.y, b.x + b.w, b.y + b.h, 0xFF4A4A5A);
             extractor.text(this.mc.font, Component.translatable(b.label),
                     b.x + 4, b.y + (b.h - 8) / 2, 0xFFCCCCCC, false);
         }
+    }
+
+    /** 1px outline via four fills with explicit coords (outline's (x,y,w,h) semantics mismatch button size). */
+    private static void outlineRect(GuiGraphicsExtractor extractor, int x1, int y1, int x2, int y2, int color) {
+        extractor.fill(x1, y1, x2, y1 + 1, color);
+        extractor.fill(x1, y2 - 1, x2, y2, color);
+        extractor.fill(x1, y1, x1 + 1, y2, color);
+        extractor.fill(x2 - 1, y1, x2, y2, color);
     }
 
     private void drawText(GuiGraphicsExtractor extractor) {
@@ -299,7 +804,7 @@ public class MapScreen extends Screen {
         extractor.text(font, Component.translatable("voxyrenderfilter.map.title"), x, y, 0xFFFFFFFF, true);
         y += 12;
         extractor.text(font, Component.translatable("voxyrenderfilter.map.active",
-                ActiveTopLevelTracker.INSTANCE.size()), x, y, 0xFFAAAAAA, true);
+                this.visibleActiveCount), x, y, 0xFFAAAAAA, true);
         y += 12;
         if (this.cacheIndex.isScanning()) {
             extractor.text(font, Component.translatable("voxyrenderfilter.map.scanning"), x, y, 0xFFFFAA00, true);
@@ -308,49 +813,80 @@ public class MapScreen extends Screen {
                     this.cacheIndex.size()), x, y, 0xFFAAAAAA, true);
         }
         y += 12;
-        if (this.selection != null) {
-            int chunksX = this.selection.maxX() - this.selection.minX() + 1;
-            int chunksZ = this.selection.maxZ() - this.selection.minZ() + 1;
-            extractor.text(font, Component.translatable("voxyrenderfilter.map.selection",
-                    this.selection.minX(), this.selection.minZ(), this.selection.maxX(), this.selection.maxZ()),
+        if (LodMapRenderer.INSTANCE.isGenerating()) {
+            extractor.text(font, Component.translatable("voxyrenderfilter.map.terrain.generating"),
+                    x, y, 0xFFFFAA00, true);
+            y += 12;
+            int[] st = LodMapRenderer.INSTANCE.stats();
+            extractor.text(font, Component.translatable("voxyrenderfilter.map.terrain.progress",
+                    st[0], st[1], st[2], st[3]), x, y, 0xFF888899, true);
+            y += 12;
+        }
+        extractor.text(font, Component.translatable(
+                this.multiSelect ? "voxyrenderfilter.map.mode.multi" : "voxyrenderfilter.map.mode.single"),
+                x, y, this.multiSelect ? 0xFFFFB020 : 0xFF888899, true);
+        y += 12;
+        int shown = 0;
+        for (SelRect sel : this.selections) {
+            if (shown >= TEXT_MAX_SELECTIONS) {
+                extractor.text(font, Component.translatable("voxyrenderfilter.map.selection.more",
+                        this.selections.size() - shown), x, y, 0xFF666677, true);
+                break;
+            }
+            shown++;
+            RectFilter s = sel.chunkRect();
+            // Section selections show lvl0 section coords (chunk >> 1), region ones the region index (chunk >> 5)
+            int shift = sel.sectionUnit() ? 1 : 5;
+            String unitKey = sel.sectionUnit()
+                    ? "voxyrenderfilter.map.selection.section"
+                    : "voxyrenderfilter.map.selection.region";
+            extractor.text(font, Component.translatable(unitKey,
+                    s.minX() >> shift, s.minZ() >> shift, s.maxX() >> shift, s.maxZ() >> shift),
                     x, y, 0xFF22AAFF, true);
             y += 12;
+            int chunksX = s.maxX() - s.minX() + 1;
+            int chunksZ = s.maxZ() - s.minZ() + 1;
             extractor.text(font, Component.translatable("voxyrenderfilter.map.selection.size",
                     chunksX * 16, chunksZ * 16, chunksX, chunksZ,
+                    (chunksX + 1) / 2, (chunksZ + 1) / 2,
                     (chunksX + 31) / 32, (chunksZ + 31) / 32), x, y, 0xFF66CCFF, true);
             y += 12;
         }
         RectFilter filter = RenderFilterState.INSTANCE.getFilter();
         if (filter != null) {
             extractor.text(font, Component.translatable("voxyrenderfilter.map.filter.active",
-                    filter.minX(), filter.minZ(), filter.maxX(), filter.maxZ()), x, y, 0xFF88FF88, true);
+                    filter.minX(), filter.minZ(), filter.maxX(), filter.maxZ(),
+                    RenderFilterState.INSTANCE.getBlockedCount()), x, y, 0xFF88FF88, true);
             y += 12;
         }
         if (this.purgeState == 1) {
             extractor.text(font, Component.translatable("voxyrenderfilter.map.purging"), x, y, 0xFFFFAA00, true);
         } else if (this.purgeState == 2) {
-            if ("-1".equals(this.purgeResult)) {
-                extractor.text(font, Component.translatable("voxyrenderfilter.map.purge.failed"), x, y, 0xFFFF4444, true);
-            } else if ("noengine".equals(this.purgeResult)) {
-                extractor.text(font, Component.translatable("voxyrenderfilter.map.noengine"), x, y, 0xFFFF4444, true);
-            } else {
-                extractor.text(font, Component.translatable("voxyrenderfilter.map.purged", this.purgeResult),
-                        x, y, 0xFF22DD44, true);
+            switch (this.purgeResult) {
+                case "filtercleared" ->
+                        extractor.text(font, Component.translatable("voxyrenderfilter.map.filter.cleared"), x, y, 0xFF22DD44, true);
+                case "-1" ->
+                        extractor.text(font, Component.translatable("voxyrenderfilter.map.purge.failed"), x, y, 0xFFFF4444, true);
+                case "noengine" ->
+                        extractor.text(font, Component.translatable("voxyrenderfilter.map.noengine"), x, y, 0xFFFF4444, true);
+                case null, default ->
+                        extractor.text(font, Component.translatable("voxyrenderfilter.map.purged", this.purgeResult),
+                                x, y, 0xFF22DD44, true);
             }
         }
         extractor.text(font, Component.translatable("voxyrenderfilter.map.help"),
                 8, this.height - 16, 0xFF666677, true);
     }
 
-    /** 选区（chunk 坐标）在屏幕上的裁剪矩形 [x1, z1, x2, z2]，不可见时返回 null。 */
-    private int[] selectionScreenRect() {
+    /** Screen rect of a selection (chunk coords), clipped; null when off-screen. */
+    private int[] selectionScreenRect(RectFilter s) {
         int z = this.zoom;
         int halfW = this.width >> 1;
         int halfH = this.height >> 1;
-        int x1 = (int) Math.floor((this.selection.minX() / 32.0 - this.centerTlnX) * z + halfW);
-        int z1 = (int) Math.floor((this.selection.minZ() / 32.0 - this.centerTlnZ) * z + halfH);
-        int x2 = (int) Math.ceil(((this.selection.maxX() + 1.0) / 32.0 - this.centerTlnX) * z + halfW);
-        int z2 = (int) Math.ceil(((this.selection.maxZ() + 1.0) / 32.0 - this.centerTlnZ) * z + halfH);
+        int x1 = (int) Math.floor((s.minX() / 32.0 - this.centerTlnX) * z + halfW);
+        int z1 = (int) Math.floor((s.minZ() / 32.0 - this.centerTlnZ) * z + halfH);
+        int x2 = (int) Math.ceil(((s.maxX() + 1.0) / 32.0 - this.centerTlnX) * z + halfW);
+        int z2 = (int) Math.ceil(((s.maxZ() + 1.0) / 32.0 - this.centerTlnZ) * z + halfH);
         int minX = Math.max(0, Math.min(x1, x2));
         int maxX = Math.min(this.width, Math.max(x1, x2));
         int minZ = Math.max(0, Math.min(z1, z2));
@@ -361,42 +897,100 @@ public class MapScreen extends Screen {
         return new int[] {minX, minZ, maxX, maxZ};
     }
 
-    //===================================================================================
-    // 输入
-    //===================================================================================
+    // Input
 
     @Override
     public boolean mouseClicked(MouseButtonEvent event, boolean bool) {
         super.mouseClicked(event, bool);
         int button = event.buttonInfo().button();
+        int mx = (int) event.x();
+        int my = (int) event.y();
+        // Menu open: clicking an item runs it and closes; clicking outside closes
+        if (this.menuOpen) {
+            if (mx >= this.menuX && mx < this.menuX + this.menuW
+                    && my >= this.menuY && my < this.menuY + this.menuH) {
+                int idx = this.menuItemAt(my);
+                this.menuOpen = false;
+                if (idx >= 0 && idx < this.menuItems.size()) {
+                    this.menuItems.get(idx).action().run();
+                }
+                return true;
+            }
+            this.menuOpen = false;
+        }
         if (button == 0) {
             for (ButtonZone b : this.buttons) {
-                if (b.contains(event.x(), event.y())) {
+                if (b.contains(mx, my)) {
                     b.action().run();
                     return true;
                 }
             }
             this.dragging = true;
-            this.selAnchorX = this.screenToChunkX(event.x());
-            this.selAnchorZ = this.screenToChunkZ(event.y());
-            this.selection = new RectFilter(this.selAnchorX, this.selAnchorZ, this.selAnchorX, this.selAnchorZ);
+            this.selSectionUnit = this.zoom >= CHUNK_SELECT_ZOOM;
+            int[] p = this.snapToUnit(mx, my, this.selSectionUnit);
+            this.selAnchorX = p[0];
+            this.selAnchorZ = p[1];
+            if (!this.multiSelect) {
+                this.selections.clear();
+            }
+            this.selections.add(new SelRect(this.makeSelectionRect(this.selAnchorX, this.selAnchorZ, this.selSectionUnit),
+                    this.selSectionUnit));
             return true;
         }
         if (button == 1) {
-            this.clearSelection();
+            // Right-drag subtracts a region from the existing selection; a plain right-click
+            // (no movement before release) opens the menu on a selection or clears empty space.
+            // The click/drag decision is made on release.
+            this.rightDragging = true;
+            this.rightSelSectionUnit = this.zoom >= CHUNK_SELECT_ZOOM;
+            int[] p = this.snapToUnit(mx, my, this.rightSelSectionUnit);
+            this.rightAnchorX = p[0];
+            this.rightAnchorZ = p[1];
+            this.rightCurX = p[0];
+            this.rightCurZ = p[1];
             return true;
         }
         return false;
     }
 
+    /** Menu Y -> item index (same layout as {@link #drawContextMenu}, including the separator); -1 when not on an item. */
+    private int menuItemAt(int my) {
+        int y = this.menuY + 2;
+        for (int i = 0; i < this.menuItems.size(); i++) {
+            if (i == 3) {
+                y += 1;
+            }
+            if (my >= y && my < y + 16) {
+                return i;
+            }
+            y += 16;
+        }
+        return -1;
+    }
+
     @Override
     public boolean mouseDragged(MouseButtonEvent event, double dx, double dy) {
+        if (this.rightDragging) {
+            int[] p = this.snapToUnit(event.x(), event.y(), this.rightSelSectionUnit);
+            this.rightCurX = p[0];
+            this.rightCurZ = p[1];
+            return true;
+        }
         if (this.dragging) {
-            int cx = this.screenToChunkX(event.x());
-            int cz = this.screenToChunkZ(event.y());
-            this.selection = new RectFilter(
-                    Math.min(this.selAnchorX, cx), Math.min(this.selAnchorZ, cz),
-                    Math.max(this.selAnchorX, cx), Math.max(this.selAnchorZ, cz));
+            SelRect last = this.selections.get(this.selections.size() - 1);
+            int[] p = this.snapToUnit(event.x(), event.y(), last.sectionUnit());
+            int cx = p[0];
+            int cz = p[1];
+            if (event.hasShiftDown()) {
+                // Shift: square selection anchored on the start, side = larger axis span
+                int dxc = cx - this.selAnchorX;
+                int dzc = cz - this.selAnchorZ;
+                int side = Math.max(Math.abs(dxc), Math.abs(dzc));
+                cx = this.selAnchorX + Integer.signum(dxc) * side;
+                cz = this.selAnchorZ + Integer.signum(dzc) * side;
+            }
+            this.selections.set(this.selections.size() - 1,
+                    new SelRect(this.makeSelectionRect(cx, cz, last.sectionUnit()), last.sectionUnit()));
             return true;
         }
         return super.mouseDragged(event, dx, dy);
@@ -405,17 +999,79 @@ public class MapScreen extends Screen {
     @Override
     public boolean mouseReleased(MouseButtonEvent event) {
         this.dragging = false;
+        if (this.rightDragging) {
+            this.rightDragging = false;
+            int[] p = this.snapToUnit(event.x(), event.y(), this.rightSelSectionUnit);
+            int ex = p[0];
+            int ez = p[1];
+            // Movement threshold: a click keeps the anchor, a drag subtracts the covered area
+            if (ex != this.rightAnchorX || ez != this.rightAnchorZ) {
+                this.subtractSelection(this.makeSelectionRect(this.rightAnchorX, this.rightAnchorZ, ex, ez,
+                        this.rightSelSectionUnit));
+            } else if (this.selectionAt((int) event.x(), (int) event.y()) >= 0) {
+                // Plain right-click on a selection opens the menu; on empty space it clears
+                this.openContextMenu((int) event.x(), (int) event.y());
+            } else {
+                this.clearSelection();
+            }
+            return true;
+        }
         return super.mouseReleased(event);
+    }
+
+    /**
+     * Cuts the given chunk-coord rect out of every selection: each selection becomes the set of
+     * pieces left after subtracting it (rect difference); pieces fully inside the cut disappear.
+     * Unit (section/region) of each remaining piece is preserved.
+     */
+    private void subtractSelection(RectFilter cut) {
+        if (this.selections.isEmpty()) {
+            return;
+        }
+        List<SelRect> result = new ArrayList<>();
+        for (SelRect sel : this.selections) {
+            for (RectFilter piece : subtractRects(sel.chunkRect(), cut)) {
+                result.add(new SelRect(piece, sel.sectionUnit()));
+            }
+        }
+        this.selections.clear();
+        this.selections.addAll(result);
+    }
+
+    /** Rect difference a minus b (inclusive chunk rects); non-empty pieces are appended to out. */
+    private static List<RectFilter> subtractRects(RectFilter a, RectFilter b) {
+        List<RectFilter> out = new ArrayList<>();
+        // Half-open intervals [min, max+1)
+        int ax1 = a.minX(), az1 = a.minZ(), ax2 = a.maxX() + 1, az2 = a.maxZ() + 1;
+        int bx1 = b.minX(), bz1 = b.minZ(), bx2 = b.maxX() + 1, bz2 = b.maxZ() + 1;
+        if (ax2 <= bx1 || bx2 <= ax1 || az2 <= bz1 || bz2 <= az1) {
+            out.add(a);
+            return out;
+        }
+        if (ax1 < bx1) {
+            out.add(new RectFilter(ax1, az1, bx1 - 1, az2 - 1));
+        }
+        if (bx2 < ax2) {
+            out.add(new RectFilter(bx2, az1, ax2 - 1, az2 - 1));
+        }
+        int cx1 = Math.max(ax1, bx1);
+        int cx2 = Math.min(ax2, bx2);
+        if (az1 < bz1) {
+            out.add(new RectFilter(cx1, az1, cx2 - 1, bz1 - 1));
+        }
+        if (bz2 < az2) {
+            out.add(new RectFilter(cx1, bz2, cx2 - 1, az2 - 1));
+        }
+        return out;
     }
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double wx, double wy) {
         if (wy != 0) {
-            // 以光标下的连续世界坐标（TLN 列，可带小数）为缩放锚点
+            // Zoom anchored on the continuous world coords under the cursor (fractional TLN columns)
             double beforeX = (mouseX - this.width / 2.0) / this.zoom + this.centerTlnX;
             double beforeZ = (mouseY - this.height / 2.0) / this.zoom + this.centerTlnZ;
-            int newZoom = (int) Math.round(this.zoom * (wy > 0 ? 1.5 : 1 / 1.5));
-            newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+            int newZoom = getNewZoom(wy);
             if (newZoom != this.zoom) {
                 this.zoom = newZoom;
                 this.centerTlnX = beforeX - (mouseX - this.width / 2.0) / this.zoom;
@@ -426,9 +1082,31 @@ public class MapScreen extends Screen {
         return super.mouseScrolled(mouseX, mouseY, wx, wy);
     }
 
+    private int getNewZoom(double wy) {
+        int newZoom = (int) Math.round(this.zoom * (wy > 0 ? 1.5 : 1 / 1.5));
+        newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+        // In the chunk-grid zoom range, snap zoom to multiples of 32 so each chunk cell (z/32) is
+        // always an integer pixel count and the grid stays even; below it no grid is drawn
+        if (newZoom >= CHUNK_SELECT_ZOOM) {
+            newZoom = Math.max(CHUNK_SELECT_ZOOM,
+                    Math.min(MAX_ZOOM, (int) (Math.round(newZoom / 32f) * 32)));
+        }
+        return newZoom;
+    }
+
     @Override
     public boolean keyPressed(KeyEvent event) {
         int key = event.key();
+        if (key == GLFW.GLFW_KEY_LEFT_CONTROL || key == GLFW.GLFW_KEY_RIGHT_CONTROL) {
+            this.multiSelect = !this.multiSelect;
+            if (!this.multiSelect && this.selections.size() > 1) {
+                // Leaving multi-select keeps only the last box drawn
+                SelRect last = this.selections.get(this.selections.size() - 1);
+                this.selections.clear();
+                this.selections.add(last);
+            }
+            return true;
+        }
         if (key == GLFW.GLFW_KEY_ENTER || key == GLFW.GLFW_KEY_KP_ENTER) {
             this.applySelectionToFilter();
             return true;
@@ -449,7 +1127,7 @@ public class MapScreen extends Screen {
             this.centerOnPlayer();
             return true;
         }
-        double pan = this.width * PAN_FRACTION / this.zoom; // TLN 列数，随缩放自适应
+        double pan = this.width * PAN_FRACTION / this.zoom; // in TLN columns, scales with zoom
         if (key == GLFW.GLFW_KEY_W || key == GLFW.GLFW_KEY_UP) {
             this.centerTlnZ -= pan;
             return true;
@@ -469,7 +1147,46 @@ public class MapScreen extends Screen {
         return super.keyPressed(event);
     }
 
-    /** 屏幕横坐标 -> 光标下的 chunk 序号（16 方块粒度）。 */
+    /**
+     * Screen coords -> chunk coords snapped to the selection granularity:
+     * sectionUnit = lvl0 section (2-chunk alignment), otherwise region file (32-chunk alignment).
+     * Uses floor, correct for negative coords.
+     */
+    private int[] snapToUnit(double sx, double sy, boolean sectionUnit) {
+        int cx = this.screenToChunkX(sx);
+        int cz = this.screenToChunkZ(sy);
+        if (sectionUnit) {
+            // lvl0 section granularity: 2-chunk alignment
+            cx = (cx >> 1) << 1;
+            cz = (cz >> 1) << 1;
+        } else {
+            // Region file granularity: 32-chunk alignment
+            cx = (cx >> 5) << 5;
+            cz = (cz >> 5) << 5;
+        }
+        return new int[] {cx, cz};
+    }
+
+    private RectFilter makeSelectionRect(int cx, int cz, boolean sectionUnit) {
+        return this.makeSelectionRect(this.selAnchorX, this.selAnchorZ, cx, cz, sectionUnit);
+    }
+
+    private RectFilter makeSelectionRect(int ax, int az, int cx, int cz, boolean sectionUnit) {
+        int minX = Math.min(ax, cx);
+        int maxX = Math.max(ax, cx);
+        int minZ = Math.min(az, cz);
+        int maxZ = Math.max(az, cz);
+        if (sectionUnit) {
+            maxX += 1;
+            maxZ += 1;
+        } else {
+            maxX += 31;
+            maxZ += 31;
+        }
+        return new RectFilter(minX, minZ, maxX, maxZ);
+    }
+
+    /** Screen X -> chunk index under the cursor (16-block units). */
     private int screenToChunkX(double sx) {
         return (int) Math.floor(((sx - this.width / 2.0) / this.zoom + this.centerTlnX) * 32.0);
     }

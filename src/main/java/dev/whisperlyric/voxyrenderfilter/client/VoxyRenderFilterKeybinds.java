@@ -9,8 +9,8 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.resources.Identifier;
 
 /**
- * 快捷键：默认未绑定，玩家在 控制-&gt;VoxyRenderFilter 分类中自行设置。
- * 按键触发时打开/关闭缓存覆盖地图（代替 /voxyrenderfilter map 命令）。
+ * Keybind: unbound by default; players set it in the Controls -> VoxyRenderFilter category.
+ * Pressing the key toggles the cache overlay map (replaces the /voxyrenderfilter map command).
  */
 public final class VoxyRenderFilterKeybinds {
 

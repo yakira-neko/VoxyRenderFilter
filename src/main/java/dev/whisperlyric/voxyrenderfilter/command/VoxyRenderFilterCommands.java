@@ -5,6 +5,7 @@ import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import dev.whisperlyric.voxyrenderfilter.filter.RectFilter;
 import dev.whisperlyric.voxyrenderfilter.filter.RenderFilterState;
 import dev.whisperlyric.voxyrenderfilter.purge.CachePurgeService;
+import dev.whisperlyric.voxyrenderfilter.purge.RenderNodeRefresh;
 import dev.whisperlyric.voxyrenderfilter.util.VoxyAccess;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -12,13 +13,15 @@ import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 
+import java.util.List;
+
 /**
- * client commands：
- * /voxyrenderfilter purge <x1> <z1> <x2> <z2> 方块坐标，后台删除矩形内 LOD 缓存
- * /voxyrenderfilter filter rect <x1> <z1> <x2> <z2> 方块坐标，设置渲染过滤矩形
- * /voxyrenderfilter filter clear 清除过滤
- * /voxyrenderfilter filter status 查看当前状态
- * 缓存覆盖地图改用快捷键打开（默认 M，见 VoxyRenderFilterKeybinds）
+ * Client commands:
+ * /voxyrenderfilter purge <x1> <z1> <x2> <z2> - block coordinates; deletes the LOD cache inside the rect in the background
+ * /voxyrenderfilter filter rect <x1> <z1> <x2> <z2> - block coordinates; sets the render filter rect
+ * /voxyrenderfilter filter clear - clears the filter
+ * /voxyrenderfilter filter status - shows the current state
+ * The cache overlay map is opened with a keybind instead (default M, see VoxyRenderFilterKeybinds)
  */
 public final class VoxyRenderFilterCommands {
 
@@ -43,10 +46,10 @@ public final class VoxyRenderFilterCommands {
                                                             int x2 = IntegerArgumentType.getInteger(ctx, "x2");
                                                             int z2 = IntegerArgumentType.getInteger(ctx, "z2");
                                                             RectFilter rect = new RectFilter(
-                                                                    RenderFilterState.blockToTln(Math.min(x1, x2)),
-                                                                    RenderFilterState.blockToTln(Math.min(z1, z2)),
-                                                                    RenderFilterState.blockToTln(Math.max(x1, x2)),
-                                                                    RenderFilterState.blockToTln(Math.max(z1, z2)));
+                                                                    Math.min(x1, x2),
+                                                                    Math.min(z1, z2),
+                                                                    Math.max(x1, x2),
+                                                                    Math.max(z1, z2));
                                                             var engine = VoxyAccess.getCurrentEngine();
                                                             if (engine == null) {
                                                                 ctx.getSource().sendFeedback(Component.translatable(
@@ -54,13 +57,18 @@ public final class VoxyRenderFilterCommands {
                                                                 return 0;
                                                             }
                                                             FabricClientCommandSource source = ctx.getSource();
-                                                            CachePurgeService.purge(engine, rect, count ->
-                                                                    Minecraft.getInstance().execute(() ->
-                                                                            source.sendFeedback(Component.translatable(
-                                                                                    count >= 0
-                                                                                            ? "voxyrenderfilter.command.purge.done"
-                                                                                            : "voxyrenderfilter.command.purge.failed",
-                                                                                    count))));
+                                                            CachePurgeService.purge(engine, rect, count -> {
+                                                                if (count > 0) {
+                                                                    // Same as the map's delete: remove the affected columns' render nodes now and rebuild delayed
+                                                                    RenderNodeRefresh.refreshForBlockRects(List.of(rect));
+                                                                }
+                                                                Minecraft.getInstance().execute(() ->
+                                                                        source.sendFeedback(Component.translatable(
+                                                                                count >= 0
+                                                                                        ? "voxyrenderfilter.command.purge.done"
+                                                                                        : "voxyrenderfilter.command.purge.failed",
+                                                                                count)));
+                                                            });
                                                             return 1;
                                                         }))))))
                 .then(ClientCommands.literal("filter")
@@ -75,6 +83,9 @@ public final class VoxyRenderFilterCommands {
                                                                     int x2 = IntegerArgumentType.getInteger(ctx, "x2");
                                                                     int z2 = IntegerArgumentType.getInteger(ctx, "z2");
                                                                     RenderFilterState.INSTANCE.setRect(x1, z1, x2, z2);
+                                                                    // Restore columns the old filter removed, then remove/rebuild the newly blocked ones
+                                                                    RenderNodeRefresh.clearFilterImmediately();
+                                                                    RenderNodeRefresh.applyFilterImmediately();
                                                                     ctx.getSource().sendFeedback(Component.translatable(
                                                                             "voxyrenderfilter.command.filter.rect", x1, z1, x2, z2));
                                                                     return 1;
@@ -82,6 +93,8 @@ public final class VoxyRenderFilterCommands {
                         .then(ClientCommands.literal("clear")
                                 .executes(ctx -> {
                                     RenderFilterState.INSTANCE.clear();
+                                    // Immediately rebuild render nodes previously removed by the filter
+                                    RenderNodeRefresh.clearFilterImmediately();
                                     ctx.getSource().sendFeedback(Component.translatable(
                                             "voxyrenderfilter.command.filter.clear"));
                                     return 1;
@@ -94,9 +107,11 @@ public final class VoxyRenderFilterCommands {
                                                 "voxyrenderfilter.command.filter.status.none"));
                                     } else {
                                         var f = state.getFilter();
-                                        ctx.getSource().sendFeedback(Component.translatable(
-                                                "voxyrenderfilter.command.filter.status.active",
-                                                f.minX(), f.minZ(), f.maxX(), f.maxZ(), state.getBlockedCount()));
+                                        if (f != null) {
+                                            ctx.getSource().sendFeedback(Component.translatable(
+                                                    "voxyrenderfilter.command.filter.status.active",
+                                                    f.minX(), f.minZ(), f.maxX(), f.maxZ(), state.getBlockedCount()));
+                                        }
                                     }
                                     return 1;
                                 })));

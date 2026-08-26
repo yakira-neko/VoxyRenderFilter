@@ -6,9 +6,8 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
 
 /**
- * 暴露 {@link SectionSerializationStorage} 的私有 backend 字段，
- * 以便删除缓存时调用 {@link StorageBackend#deleteSectionData(long)}。
- * voxy 类不做映射，因此 remap = false。
+ * Exposes {@link SectionSerializationStorage}'s private backend field so the cache deletion code can
+ * call {@link StorageBackend#deleteSectionData(long)}. voxy classes are not mapped, hence remap = false.
  */
 @Mixin(SectionSerializationStorage.class)
 public interface SectionSerializationStorageAccessor {

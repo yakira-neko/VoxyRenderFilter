@@ -39,5 +39,4 @@ replay_*.log
 *.hprof
 *.jfr
 
-refs/
 libs/

@@ -7,16 +7,13 @@ import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import net.minecraft.client.Minecraft;
 
-/**
- * 从当前客户端世界获取 voxy 的 WorldEngine / StorageBackend 的工具方法。
- */
 public final class VoxyAccess {
 
     private VoxyAccess() {
     }
 
     /**
-     * 当前客户端世界的 voxy WorldEngine（未加载或不可用时返回 null）。
+     * voxy WorldEngine of the current client world (null when not loaded or unavailable).
      */
     public static WorldEngine getCurrentEngine() {
         Minecraft mc = Minecraft.getInstance();
@@ -32,9 +29,9 @@ public final class VoxyAccess {
     }
 
     /**
-     * 当前 WorldEngine 的磁盘 backend。
-     * voxy 默认 storage 运行时类型是 {@link SectionSerializationStorage}，
-     * 用户自定义存储时可能不是该类型，此时返回 null（调用方按失败处理）。
+     * Disk backend of the current WorldEngine.
+     * voxy's default storage runtime type is {@link SectionSerializationStorage}; a custom storage
+     * configuration may use another type, in which case null is returned (callers treat it as failure).
      */
     public static StorageBackend getStorageBackend(WorldEngine engine) {
         if (engine == null || !(engine.storage instanceof SectionSerializationStorage storage)) {

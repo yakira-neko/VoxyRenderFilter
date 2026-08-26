@@ -12,10 +12,9 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 在 HUD 渲染入口绘制当前过滤状态一行文本。
- * <p>
- * 26.x 的 HUD 走 {@code GuiGraphicsExtractor}（抽离 + 帧末绘制），
- * 文本用绝对屏幕坐标，颜色必须为 8 位 ARGB。
+ * Draws a one-line status text of the current filter state at the HUD rendering entry point.
+ * In 26.x the HUD renders through {@code GuiGraphicsExtractor} (extract, then draw at frame end),
+ * so text uses absolute screen coordinates and colors must be 8-bit ARGB.
  */
 @Mixin(Gui.class)
 public abstract class GuiMixin {
@@ -27,7 +26,7 @@ public abstract class GuiMixin {
             return;
         }
         Minecraft mc = Minecraft.getInstance();
-        // 颜色必须显式 8 位 ARGB，否则高位 0 = alpha 0 = 全透明
+        // Color must be explicit 8-bit ARGB; a zero high byte means alpha 0 = fully transparent
         graphics.text(mc.font, text.getVisualOrderText(), 4, 4, 0xFFFFFFFF, true);
     }
 }

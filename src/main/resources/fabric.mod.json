@@ -4,6 +4,7 @@
   "version": "${version}",
   "name": "VoxyRenderFilter",
   "description": "Shows voxy cache coverage on a map, renders only selected regions and deletes region LOD cache.",
+  "icon": "assets/voxyrenderfilter/icon.png",
   "authors": [
     "Whisperlyric"
   ],

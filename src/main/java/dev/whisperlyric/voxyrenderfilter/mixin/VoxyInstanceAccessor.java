@@ -1,6 +1,7 @@
 package dev.whisperlyric.voxyrenderfilter.mixin;
 
 import me.cortex.voxy.common.world.WorldEngine;
+import me.cortex.voxy.common.world.service.SectionSavingService;
 import me.cortex.voxy.commonImpl.VoxyInstance;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import org.spongepowered.asm.mixin.Mixin;
@@ -10,8 +11,8 @@ import java.util.HashMap;
 import java.util.concurrent.locks.StampedLock;
 
 /**
- * 暴露 voxy {@link VoxyInstance} 的私有 activeWorlds 表及其 StampedLock，
- * 供服务器切换时安全移除空闲引擎（voxy 自身没有「释放指定世界」的公开接口）。
+ * Exposes voxy {@link VoxyInstance}'s private activeWorlds table and its StampedLock so idle engines
+ * can be removed safely on server switch (voxy has no public interface for releasing a specific world).
  */
 @Mixin(VoxyInstance.class)
 public interface VoxyInstanceAccessor {
@@ -21,4 +22,7 @@ public interface VoxyInstanceAccessor {
 
     @Accessor(value = "activeWorldLock", remap = false)
     StampedLock voxyrenderfilter$getActiveWorldLock();
+
+    @Accessor(value = "savingService", remap = false)
+    SectionSavingService voxyrenderfilter$getSavingService();
 }
