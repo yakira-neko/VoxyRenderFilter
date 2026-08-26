@@ -1,42 +1,67 @@
 # VoxyRenderFilter
 
-Shows the voxy LOD cache coverage on an in-game map, renders only selected regions and deletes region LOD cache.
+Shows the voxy LOD cache coverage on an in-game map, with region-based render filtering, region cache deletion, map tile caching and view-distance / background-alpha adjustment.
 
 ## Features
 
 ### Cache Map
 - Real terrain map generated from the on-disk voxy LOD cache (all levels, lvl0–lvl4), visible even far from the player
-- Coverage overlays: pale = disk-cached regions, green = currently rendering columns with usable data, orange = filtered/blocked regions
-- Translucent player arrow showing your position and facing
+- **Map tile cache**: each region file (TLN column, 512x512 blocks) is saved as a PNG plus a hash sidecar; the map renders the cache first and then validates it once in the background ("render first, validate later")
+- Cache layout:
+  - Singleplayer: `<save dir>/vrf_mapcache/<dimensionId>/`
+  - Multiplayer: `<game dir>/vrf_mapcache/<server IP>/<world key>/<dimensionId>/` (world key = seed, so Velocity sub-servers are kept separate automatically)
+- **IP mapping**: configure `"ip1": ["ip2", "ip3"]` in the config so multi-line servers share one cache (all add/delete/read/scan operations go through the mapping)
+- Coverage overlays: pale = disk-cached regions, green = columns inside the render ring with usable data, orange = filtered/blocked regions; green is clipped to voxy's circular ring, so no residue remains after shrinking the view distance
+- Translucent player arrow (hidden while previewing another dimension; overworld<->nether previews convert coordinates 8:1)
 - Chunk grid drawn inside selections at high zoom
-- Top-right button bar: clear filter / delete cache / clear selection / rescan / center / overlay toggle
-- Overlay toggle hides the pale/green/orange overlays to view the raw terrain
-- Auto re-scan detects newly cached columns (every ~2s) — no manual refresh required
+- Generated columns are all kept (no LRU eviction), so scans/generation never make rendered regions disappear
+
+### Scanning & Sync
+- **Scan mode** (persisted in the config): AUTO = a background thread continuously syncs cache changes around the player (vanilla render distance) and pre-generates missing columns; MANUAL = scanning only happens when you click "Rescan" (on an async thread)
+- In MANUAL mode "Rescan" only processes region-file selections (chunk-level selections are ignored); a new rescan cancels the old pending tasks
+- **Dimension cycle button** (`dimension:<dimensionId>`): cycles through dimensions that have cached tiles; previewing another dimension only loads the cache (no validation, no player arrow), and filter operations are disabled (except invert and delete-cache)
+- The coverage overlay loads only when the map opens / when cycling back to the player's dimension (event-driven, not proactive)
 
 ### Region Selection
-- Left-drag to box-select; **right-drag** subtracts from the existing selection; **Ctrl** toggles multi-select; hold **Shift** for square selection
+- Left-drag to box-select; right-drag subtracts; **Ctrl** toggles multi-select; hold **Shift** for square selection
 - Selection snaps to region files (32x32 chunks) at low zoom and to lvl0 sections (2x2 chunks) at high zoom
-- Right-click a selection to open the operation menu; right-click empty space to clear
-- Scroll to zoom (anchored at cursor); **WASD** / arrow keys to pan; **R** rescan; **H** center on player; **C** clear selection
+- Multiple selections are merged into non-overlapping rectangles automatically
+- **Selection toggle** (button or **G**): when off, left-drag pans the map directly while existing selections are kept; pan step is 1/16 of the original
+- Right-click a selection for the operation menu; right-click empty space to clear
+- Scroll to zoom (anchored at cursor); **WASD** / arrow keys to pan; **R** rescan; **H** center on player; **C** clear selection; **Enter** block; **Del** delete
 - Selection coordinates and size (blocks/chunks/sections/regions) shown live on the map
 
 ### Render Filter
-- Block rendering in the selected regions, render only the selected regions, invert, or unblock
-- Takes effect immediately — no need to disable and re-enable voxy
-- Fully blocked columns are removed from the render ring; partially blocked sections render as empty holes
-- Invert is confined to the voxy render distance
+- Block rendering in the selected regions, render only the selected regions, invert, or unblock; takes effect immediately without disabling/re-enabling voxy
+- Fully blocked columns are removed from the render ring; partially blocked lvl0 sections (2x2 chunks) render as empty holes
+- Invert is confined to the voxy circular render distance
 - Filter state (mode, rect, blocked count) is shown at the top-left of the HUD while active
+- Built-in crash guard for voxy's node-manager removal race
 
 ### Cache Deletion
-- Delete the LOD cache of all levels (lvl0–lvl4) inside the selection; coarse LOD sections cover the selected area too and must be removed, otherwise the deleted data lingers
+- Deletes the LOD cache of all levels (lvl0–lvl4) inside the selection; coarse LOD sections cover the selected area too and must be removed, otherwise the deleted data lingers
 - Render nodes are refreshed immediately and rebuilt from the current disk state
+- Note: voxy has no public "partial LOD rebuild" API — deleting any fine-grained data also removes the coarse LOD sections covering it (which span the whole region file); the region only recovers after the world re-ingests those chunks
 - Loaded neighbors that are accidentally purged are re-ingested from the live world
+
+### Map Settings
+- **View-distance input**: same value/unit as voxy's config slider (10..1024, in 2x2-chunk units); Enter applies it, persists to voxy's config, and stays in sync with voxy in real time
+- **Background-alpha input**: 0-255, persisted
+- Top-right button bar: clear filter / delete cache / clear selection / rescan / center / overlay toggle / selection toggle / scan mode / dimension cycle
+
+### Localization
+- Ships Chinese language files for voxy and Sodium (override their English UI at runtime)
 
 ### Commands
 - `/voxyrenderfilter purge <x1> <z1> <x2> <z2>` — delete LOD cache inside a block-coordinate rectangle
 - `/voxyrenderfilter filter rect <x1> <z1> <x2> <z2>` — set the render filter rectangle
 - `/voxyrenderfilter filter clear` — clear the filter
 - `/voxyrenderfilter filter status` — show the current filter state
+
+### Config (`config/voxyrenderfilter.json`)
+- `scanMode` — `"AUTO"` / `"MANUAL"` scan mode
+- `backgroundAlpha` — map background alpha 0-255
+- `ipMappings` — IP mapping table (share cache across multi-line servers)
 
 ## Supported Versions
 
