@@ -31,6 +31,10 @@
   "voxyrenderfilter.map.button.center": "Center",
   "voxyrenderfilter.map.button.overlay.on": "Overlay: On",
   "voxyrenderfilter.map.button.overlay.off": "Overlay: Off",
+  "voxyrenderfilter.map.button.select.on": "Select: On",
+  "voxyrenderfilter.map.button.select.off": "Select: Off",
+  "voxyrenderfilter.map.viewdistance": "View dist (2*2chunks):",
+  "voxyrenderfilter.map.backgroundalpha": "Background alpha:",
   "voxyrenderfilter.map.menu.block": "Block rendering in this region",
   "voxyrenderfilter.map.menu.unblock": "Unblock rendering in this region",
   "voxyrenderfilter.map.menu.allow": "Render only selected region",
@@ -41,5 +45,5 @@
   "voxyrenderfilter.map.purged": "Purged %s sections",
   "voxyrenderfilter.map.purge.failed": "Purge failed: no storage backend",
   "voxyrenderfilter.map.noengine": "No voxy engine (not in a world or not loaded)",
-  "voxyrenderfilter.map.help": "Drag: Select  |  Right-drag: Subtract  |  Right-click selection: Menu  |  Right-click empty: Clear  |  Scroll: Zoom  |  WASD: Pan  |  Ctrl: Multi  |  Shift: Square  |  Enter: Block  |  Del: Purge  |  R: Rescan  |  H: Center"
+  "voxyrenderfilter.map.help": "Drag: Select  |  Right-drag: Subtract  |  Right-click selection: Menu  |  Right-click empty: Clear  |  Scroll: Zoom  |  WASD: Pan  |  Ctrl: Multi  |  Shift: Square  |  Enter: Block  |  Del: Purge  |  R: Rescan  |  H: Center  |  G: Select mode"
 }

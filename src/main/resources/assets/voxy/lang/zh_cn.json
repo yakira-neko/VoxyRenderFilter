@@ -1,0 +1,36 @@
+{
+  "voxy.config.title": "Voxy",
+
+  "voxy.config.general": "常规",
+  "voxy.config.rendering": "渲染",
+
+  "voxy.config.general.enabled": "启用 Voxy",
+  "voxy.config.general.enabled.tooltip": "完全启用或禁用 voxy",
+
+  "voxy.config.general.serviceThreads": "服务线程数",
+  "voxy.config.general.serviceThreads.tooltip": "ServiceThreadPool 可使用的线程数量",
+
+  "voxy.config.general.useSodiumBuilder": "使用 Sodium 线程",
+  "voxy.config.general.useSodiumBuilder.tooltip": "将 Sodium 的构建线程并入 voxy 的线程池，可在高渲染距离下快速移动时减少卡顿和延迟",
+
+  "voxy.config.general.ingest": "区块摄入",
+  "voxy.config.general.ingest.tooltip": "启用或禁用 voxy 将新区块转换为 LOD 的功能",
+
+  "voxy.config.general.rendering": "Voxy 渲染",
+  "voxy.config.general.rendering.tooltip": "启用或禁用 voxy 渲染",
+
+  "voxy.config.general.subDivisionSize": "细分大小（平方像素）",
+  "voxy.config.general.subDivisionSize.tooltip": "屏幕空间 AABB 在细分为更小 LOD 前允许的最大像素面积（越小 = 质量越高）",
+
+  "voxy.config.general.renderDistance": "渲染距离",
+  "voxy.config.general.renderDistance.tooltip": "voxy 渲染距离（单位:区块）",
+
+  "voxy.config.general.environmental_fog": "启用环境雾",
+  "voxy.config.general.environmental_fog.tooltip": "启用或禁用 voxy 的环境雾渲染",
+
+  "voxy.config.general.render_fog": "启用渲染雾",
+  "voxy.config.general.render_fog.tooltip": "启用或禁用渲染雾效果",
+
+  "voxy.config.general.ssao_mode": "SSAO 模式",
+  "voxy.config.general.ssao_mode.tooltip": "屏幕空间环境光遮蔽所使用的模式（自动会尝试在降低性能影响的同时选择最佳方案）"
+}

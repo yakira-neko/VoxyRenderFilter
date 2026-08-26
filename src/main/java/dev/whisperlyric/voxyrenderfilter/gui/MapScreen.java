@@ -10,13 +10,18 @@ import dev.whisperlyric.voxyrenderfilter.tracker.ActiveTopLevelTracker;
 import dev.whisperlyric.voxyrenderfilter.util.VoxyAccess;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.service.VoxelIngestService;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.CharacterEvent;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.player.LocalPlayer;
@@ -42,7 +47,8 @@ public class MapScreen extends Screen {
     private static final int MIN_ZOOM = 2;
     /** Max zoom: px per TLN column (512 blocks); 4096 = 128px per chunk. */
     private static final int MAX_ZOOM = 4096;
-    private static final double PAN_FRACTION = 0.5;
+    /** Pan distance per WASD/arrow keypress as a screen fraction; 1/16 of the former half-screen step (~1/32 screen). */
+    private static final double PAN_FRACTION = 0.03;
     /** Above this zoom (>= 2px per chunk) selection snaps to lvl0 sections (2x2 chunks). */
     private static final int CHUNK_SELECT_ZOOM = 128;
     /** Above this zoom (>= 4px per chunk) draw a chunk grid inside selections. */
@@ -53,8 +59,23 @@ public class MapScreen extends Screen {
     private static final int TEXT_MAX_SELECTIONS = 6;
     private static final String OVERLAY_LABEL_ON = "voxyrenderfilter.map.button.overlay.on";
     private static final String OVERLAY_LABEL_OFF = "voxyrenderfilter.map.button.overlay.off";
+    private static final String SELECT_LABEL_ON = "voxyrenderfilter.map.button.select.on";
+    private static final String SELECT_LABEL_OFF = "voxyrenderfilter.map.button.select.off";
     /** Index of the overlay toggle in the button column (last). */
     private static final int OVERLAY_BUTTON_INDEX = 5;
+    /** Index of the selection-mode toggle (appended after the overlay button). */
+    private static final int SELECT_BUTTON_INDEX = 6;
+    /**
+     * View distance input bounds, mirroring voxy's own config slider value (10..1024) exactly:
+     * same number, same unit, voxy stays the source of truth.
+     */
+    private static final int VIEW_DISTANCE_MIN = 10;
+    private static final int VIEW_DISTANCE_MAX = 1024;
+    private static final int VIEW_DISTANCE_BOX_W = 64;
+    private static final String ALPHA_LABEL = "voxyrenderfilter.map.backgroundalpha";
+    private static final int ALPHA_BOX_W = 64;
+    /** Background color behind the map (dark); alpha comes from the adjustable {@link #backgroundAlpha} field. */
+    private static final int BACKGROUND_RGB = 0x15151D;
     private static final int CACHED_COLOR = 0x50A0B8C8;
     private static final int ACTIVE_COLOR = 0x802F9E4F;
     private static final int ACTIVE_BORDER_COLOR = 0x801B5E2F;
@@ -84,7 +105,10 @@ public class MapScreen extends Screen {
 
     private final List<SelRect> selections = new ArrayList<>();
     private boolean multiSelect;
+    /** When false, left-drag pans the map instead of drawing a selection box; existing selections stay visible. */
+    private boolean selectionMode = true;
     private boolean dragging;
+    private boolean panning;
     private boolean selSectionUnit;
     private int selAnchorX;
     private int selAnchorZ;
@@ -113,6 +137,11 @@ public class MapScreen extends Screen {
     private int visibleActiveCount;
     /** Whether the color overlays (cached / active / blocked) are drawn, toggled by the top-right button. */
     private boolean showOverlays = true;
+    /** Precise voxy render distance input (same value/unit as voxy's config slider, 10..1024); mirrors voxy's value when not focused. */
+    private EditBox viewDistanceBox;
+    /** Map screen background alpha (0-255); 255 = fully opaque (default), adjustable via the input box. */
+    private int backgroundAlpha = 255;
+    private EditBox backgroundAlphaBox;
 
     public MapScreen() {
         super(Component.translatable("voxyrenderfilter.map.title"));
@@ -131,7 +160,8 @@ public class MapScreen extends Screen {
                 "voxyrenderfilter.map.button.clear",
                 "voxyrenderfilter.map.button.rescan",
                 "voxyrenderfilter.map.button.center",
-                this.overlayLabel()
+                this.overlayLabel(),
+                this.selectLabel()
         };
         List<Runnable> actions = List.of(
                 this::clearFilter,
@@ -139,14 +169,17 @@ public class MapScreen extends Screen {
                 this::clearSelection,
                 this::requestScan,
                 this::centerOnPlayer,
-                this::toggleOverlays);
+                this::toggleOverlays,
+                this::toggleSelectionMode);
         int maxW = 0;
         for (String label : labels) {
             maxW = Math.max(maxW, this.mc.font.width(Component.translatable(label)));
         }
-        // The toggle label changes; reserve the wider of the two states so the button does not resize
+        // The toggle labels change; reserve the wider of the two states so the buttons do not resize
         maxW = Math.max(maxW, this.mc.font.width(Component.translatable(OVERLAY_LABEL_ON)));
         maxW = Math.max(maxW, this.mc.font.width(Component.translatable(OVERLAY_LABEL_OFF)));
+        maxW = Math.max(maxW, this.mc.font.width(Component.translatable(SELECT_LABEL_ON)));
+        maxW = Math.max(maxW, this.mc.font.width(Component.translatable(SELECT_LABEL_OFF)));
         int w = maxW + 14;
         int x = this.width - w - 4;
         int y = 4;
@@ -154,6 +187,18 @@ public class MapScreen extends Screen {
             this.buttons.add(new ButtonZone(x, y, w, 18, labels[i], actions.get(i)));
             y += 22;
         }
+        // Precise voxy render distance input (TLN columns), below the button column, right-aligned
+        this.viewDistanceBox = new EditBox(this.mc.font,
+                this.width - VIEW_DISTANCE_BOX_W - 4, y + 8, VIEW_DISTANCE_BOX_W, 18,
+                Component.translatable("voxyrenderfilter.map.viewdistance"));
+        this.viewDistanceBox.setMaxLength(4);
+        this.viewDistanceBox.setFocused(false);
+        // Background transparency input (0-255), below the view distance box, right-aligned
+        this.backgroundAlphaBox = new EditBox(this.mc.font,
+                this.width - ALPHA_BOX_W - 4, this.viewDistanceBox.getY() + 18 + 8, ALPHA_BOX_W, 18,
+                Component.translatable(ALPHA_LABEL));
+        this.backgroundAlphaBox.setMaxLength(3);
+        this.backgroundAlphaBox.setFocused(false);
     }
 
     private void requestScan() {
@@ -189,6 +234,151 @@ public class MapScreen extends Screen {
             this.buttons.set(OVERLAY_BUTTON_INDEX,
                     new ButtonZone(b.x(), b.y(), b.w(), b.h(), this.overlayLabel(), this::toggleOverlays));
         }
+    }
+
+    /** Translation key of the current selection-mode toggle state. */
+    private String selectLabel() {
+        return this.selectionMode ? SELECT_LABEL_ON : SELECT_LABEL_OFF;
+    }
+
+    /** Toggles selection mode (off = left-drag pans the map, selections kept) and refreshes the button label. */
+    private void toggleSelectionMode() {
+        this.selectionMode = !this.selectionMode;
+        if (SELECT_BUTTON_INDEX < this.buttons.size()) {
+            ButtonZone b = this.buttons.get(SELECT_BUTTON_INDEX);
+            this.buttons.set(SELECT_BUTTON_INDEX,
+                    new ButtonZone(b.x(), b.y(), b.w(), b.h(), this.selectLabel(), this::toggleSelectionMode));
+        }
+    }
+
+    /** Current voxy render distance (the same number voxy's config slider shows, 10..1024), or -1 when voxy config is unavailable. */
+    private int currentViewDistance() {
+        VoxyConfig config = VoxyConfig.CONFIG;
+        if (config == null) {
+            return -1;
+        }
+        // Mirror voxy's config slider exactly: value = round(sectionRenderDistance * 16)
+        return Math.round(config.sectionRenderDistance * 16);
+    }
+
+    /** Mirrors voxy's actual value into the input box unless the player is editing it. */
+    private void syncViewDistanceBox() {
+        if (this.viewDistanceBox == null || this.viewDistanceBox.isFocused()) {
+            return;
+        }
+        int cur = this.currentViewDistance();
+        if (cur >= 0) {
+            this.viewDistanceBox.setValue(String.valueOf(cur));
+        }
+    }
+
+    /** Applies the typed value (10..1024, same as voxy's slider) through voxy's own conversion and persists it; invalid input is ignored (the box re-syncs next frame). */
+    private void applyViewDistance() {
+        if (this.viewDistanceBox == null) {
+            return;
+        }
+        this.viewDistanceBox.setFocused(false);
+        int value;
+        try {
+            value = Integer.parseInt(this.viewDistanceBox.getValue().trim());
+        } catch (NumberFormatException e) {
+            return;
+        }
+        if (value < VIEW_DISTANCE_MIN || value > VIEW_DISTANCE_MAX) {
+            return;
+        }
+        // Same mapping as voxy's config slider: sectionRenderDistance = value / 16
+        float sectionRenderDistance = value / 16.0f;
+        VoxyConfig config = VoxyConfig.CONFIG;
+        if (config == null) {
+            return;
+        }
+        config.sectionRenderDistance = sectionRenderDistance;
+        config.save();
+        VoxyRenderSystem renderSystem = IVoxyRenderSystemHolder.getNullable();
+        if (renderSystem != null) {
+            renderSystem.setRenderDistance(sectionRenderDistance);
+        }
+    }
+
+    /** Draws the view distance input box with a label; hidden when voxy config is unavailable. */
+    private void drawViewDistanceInput(GuiGraphicsExtractor extractor, int mouseX, int mouseY, float partialTick) {
+        if (this.viewDistanceBox == null || this.currentViewDistance() < 0) {
+            return;
+        }
+        this.syncViewDistanceBox();
+        Component label = Component.translatable("voxyrenderfilter.map.viewdistance");
+        int labelW = this.mc.font.width(label);
+        extractor.text(this.mc.font, label, this.viewDistanceBox.getX() - labelW - 6,
+                this.viewDistanceBox.getY() + (18 - 8) / 2, 0xFFAAAAAA, true);
+        this.viewDistanceBox.extractWidgetRenderState(extractor, mouseX, mouseY, partialTick);
+    }
+
+    /** Applies the typed value to the map background alpha; invalid input is ignored (the box re-syncs next frame). */
+    private void applyBackgroundAlpha() {
+        if (this.backgroundAlphaBox == null) {
+            return;
+        }
+        this.backgroundAlphaBox.setFocused(false);
+        int value;
+        try {
+            value = Integer.parseInt(this.backgroundAlphaBox.getValue().trim());
+        } catch (NumberFormatException e) {
+            return;
+        }
+        if (value < 0 || value > 255) {
+            return;
+        }
+        this.backgroundAlpha = value;
+    }
+
+    /** Draws the background transparency input box with a label; reflects the current alpha when not focused. */
+    private void drawBackgroundAlphaInput(GuiGraphicsExtractor extractor, int mouseX, int mouseY, float partialTick) {
+        if (this.backgroundAlphaBox == null) {
+            return;
+        }
+        if (!this.backgroundAlphaBox.isFocused()) {
+            this.backgroundAlphaBox.setValue(String.valueOf(this.backgroundAlpha));
+        }
+        Component label = Component.translatable(ALPHA_LABEL);
+        int labelW = this.mc.font.width(label);
+        extractor.text(this.mc.font, label, this.backgroundAlphaBox.getX() - labelW - 6,
+                this.backgroundAlphaBox.getY() + (18 - 8) / 2, 0xFFAAAAAA, true);
+        this.backgroundAlphaBox.extractWidgetRenderState(extractor, mouseX, mouseY, partialTick);
+    }
+
+    /** Focuses the box when the click lands on it; unfocuses it otherwise. Returns true when the click was on the box. */
+    private boolean handleBoxClick(EditBox box, int mx, int my, MouseButtonEvent event) {
+        if (box == null) {
+            return false;
+        }
+        if (box.isMouseOver(mx, my)) {
+            box.setFocused(true);
+            box.onClick(event, false);
+            return true;
+        }
+        box.setFocused(false);
+        return false;
+    }
+
+    /** Handles Enter (apply) / Esc (cancel) / key forwarding for a focused input box; true = consumed. */
+    private boolean handleFocusedBoxKey(EditBox box, int key, KeyEvent event) {
+        if (box == null || !box.isFocused()) {
+            return false;
+        }
+        if (key == GLFW.GLFW_KEY_ENTER || key == GLFW.GLFW_KEY_KP_ENTER) {
+            if (box == this.viewDistanceBox) {
+                this.applyViewDistance();
+            } else if (box == this.backgroundAlphaBox) {
+                this.applyBackgroundAlpha();
+            }
+            return true;
+        }
+        if (key == GLFW.GLFW_KEY_ESCAPE) {
+            box.setFocused(false);
+            return true;
+        }
+        return box.keyPressed(event);
     }
 
     /** Clears the render filter: restores rendering of all TLN columns. */
@@ -421,7 +611,7 @@ public class MapScreen extends Screen {
         if (this.width == 0 || this.height == 0) {
             return;
         }
-        extractor.fill(0, 0, this.width, this.height, 0xFF15151D);
+        extractor.fill(0, 0, this.width, this.height, (this.backgroundAlpha << 24) | BACKGROUND_RGB);
 
         // Real LOD terrain map: request the visible columns and draw (bottom layer)
         LodMapRenderer.INSTANCE.update(extractor, VoxyAccess.getCurrentEngine(),
@@ -438,6 +628,8 @@ public class MapScreen extends Screen {
         }
         this.drawPlayer(extractor);
         this.drawButtons(extractor, mouseX, mouseY);
+        this.drawViewDistanceInput(extractor, mouseX, mouseY, partialTick);
+        this.drawBackgroundAlphaInput(extractor, mouseX, mouseY, partialTick);
         this.drawText(extractor);
         this.drawContextMenu(extractor, mouseX, mouseY);
     }
@@ -919,11 +1111,21 @@ public class MapScreen extends Screen {
             this.menuOpen = false;
         }
         if (button == 0) {
+            boolean onViewBox = this.handleBoxClick(this.viewDistanceBox, mx, my, event);
+            boolean onAlphaBox = this.handleBoxClick(this.backgroundAlphaBox, mx, my, event);
+            if (onViewBox || onAlphaBox) {
+                return true;
+            }
             for (ButtonZone b : this.buttons) {
                 if (b.contains(mx, my)) {
                     b.action().run();
                     return true;
                 }
+            }
+            if (!this.selectionMode) {
+                // Selection off: left-drag pans the map instead of drawing a box
+                this.panning = true;
+                return true;
             }
             this.dragging = true;
             this.selSectionUnit = this.zoom >= CHUNK_SELECT_ZOOM;
@@ -976,6 +1178,12 @@ public class MapScreen extends Screen {
             this.rightCurZ = p[1];
             return true;
         }
+        if (this.panning) {
+            // Grab-and-pull panning: content follows the cursor (1 screen px = 1/zoom TLN columns)
+            this.centerTlnX -= dx / this.zoom;
+            this.centerTlnZ -= dy / this.zoom;
+            return true;
+        }
         if (this.dragging) {
             SelRect last = this.selections.get(this.selections.size() - 1);
             int[] p = this.snapToUnit(event.x(), event.y(), last.sectionUnit());
@@ -999,6 +1207,7 @@ public class MapScreen extends Screen {
     @Override
     public boolean mouseReleased(MouseButtonEvent event) {
         this.dragging = false;
+        this.panning = false;
         if (this.rightDragging) {
             this.rightDragging = false;
             int[] p = this.snapToUnit(event.x(), event.y(), this.rightSelSectionUnit);
@@ -1089,7 +1298,7 @@ public class MapScreen extends Screen {
         // always an integer pixel count and the grid stays even; below it no grid is drawn
         if (newZoom >= CHUNK_SELECT_ZOOM) {
             newZoom = Math.max(CHUNK_SELECT_ZOOM,
-                    Math.min(MAX_ZOOM, (int) (Math.round(newZoom / 32f) * 32)));
+                    Math.min(MAX_ZOOM, Math.round(newZoom / 32f) * 32));
         }
         return newZoom;
     }
@@ -1097,6 +1306,10 @@ public class MapScreen extends Screen {
     @Override
     public boolean keyPressed(KeyEvent event) {
         int key = event.key();
+        if (this.handleFocusedBoxKey(this.viewDistanceBox, key, event)
+                || this.handleFocusedBoxKey(this.backgroundAlphaBox, key, event)) {
+            return true;
+        }
         if (key == GLFW.GLFW_KEY_LEFT_CONTROL || key == GLFW.GLFW_KEY_RIGHT_CONTROL) {
             this.multiSelect = !this.multiSelect;
             if (!this.multiSelect && this.selections.size() > 1) {
@@ -1127,6 +1340,10 @@ public class MapScreen extends Screen {
             this.centerOnPlayer();
             return true;
         }
+        if (key == GLFW.GLFW_KEY_G) {
+            this.toggleSelectionMode();
+            return true;
+        }
         double pan = this.width * PAN_FRACTION / this.zoom; // in TLN columns, scales with zoom
         if (key == GLFW.GLFW_KEY_W || key == GLFW.GLFW_KEY_UP) {
             this.centerTlnZ -= pan;
@@ -1145,6 +1362,13 @@ public class MapScreen extends Screen {
             return true;
         }
         return super.keyPressed(event);
+    }
+
+    @Override
+    public boolean charTyped(CharacterEvent event) {
+        EditBox box = this.viewDistanceBox != null && this.viewDistanceBox.isFocused() ? this.viewDistanceBox
+                : this.backgroundAlphaBox != null && this.backgroundAlphaBox.isFocused() ? this.backgroundAlphaBox : null;
+        return box != null && box.charTyped(event);
     }
 
     /**
