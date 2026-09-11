@@ -39,7 +39,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Generates the real terrain map from the on-disk voxy LOD cache: one 512x512 texture per TLN
- * column. A background thread reads every LOD level (lvl0-4) and fills the topmost non-air block
+ * column. Background worker threads read every LOD level (lvl0-4) and fill the topmost non-air block
  * per voxel column (lvl0 first, coarse LOD only patches pixels left empty); the render thread
  * uploads finished textures and blits them. Only visible columns are generated, capped with an LRU
  * limit; invalidate() rebuilds everything when the world engine changes or the cache is deleted.
@@ -55,6 +55,9 @@ public final class LodMapRenderer {
     /** Max generation radius per request (in columns); prevents an infinite generate-evict loop when many columns are visible at low zoom. */
     private static final int GEN_RADIUS_MAX = 5;
     private static final int MAX_UPLOADS_PER_FRAME = 4;
+    /** Generation worker count: tile generation is deserialize/scan CPU work, so a small pool
+     * multiplies throughput; the cap keeps concurrent disk reads reasonable. */
+    private static final int GENERATION_THREADS = Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2));
     private static final int BIGGEST_SERIALIZED_SECTION_SIZE = SECTION_VOL * 8 * 2 + 8;
     /** Interval between on-disk new-column checks (in frames, ~2s at 60fps). */
     private static final int STALE_CHECK_INTERVAL = 40;
@@ -80,6 +83,8 @@ public final class LodMapRenderer {
 
     private final ConcurrentHashMap<Long, Column> columns = new ConcurrentHashMap<>();
     private final ConcurrentLinkedQueue<Column> uploads = new ConcurrentLinkedQueue<>();
+    /** Columns whose texture was replaced by a duplicate generation; the render thread frees their GL resources. */
+    private final ConcurrentLinkedQueue<Column> staleColumns = new ConcurrentLinkedQueue<>();
     private final Object lock = new Object();
     private final LongOpenHashSet pendingSet = new LongOpenHashSet();
     /** Columns that failed to generate: never retried this session (cleared by invalidate on disk change), so a bad column cannot block the queue. */
@@ -104,7 +109,8 @@ public final class LodMapRenderer {
     /** One-shot re-validation of rendered columns requested (map open / view distance change). */
     private volatile boolean validationPending;
     private volatile boolean closed;
-    private Thread worker;
+    /** Generation worker pool, managed on the main thread only (prune dead, top up to the target count). */
+    private final List<Thread> workers = new ArrayList<>();
     private GpuSampler sampler;
     private long tick;
 
@@ -302,12 +308,13 @@ public final class LodMapRenderer {
     }
 
     private void startWorkerIfNeeded() {
-        if (this.worker != null && this.worker.isAlive()) {
-            return;
+        this.workers.removeIf(t -> !t.isAlive());
+        while (this.workers.size() < GENERATION_THREADS) {
+            Thread t = new Thread(this::workerLoop, "VRF lod map-" + this.workers.size());
+            t.setDaemon(true);
+            this.workers.add(t);
+            t.start();
         }
-        this.worker = new Thread(this::workerLoop, "VRF lod map");
-        this.worker.setDaemon(true);
-        this.worker.start();
     }
 
     private void workerLoop() {
@@ -315,6 +322,12 @@ public final class LodMapRenderer {
             Long packed = this.nextPending();
             if (packed == null) {
                 return;
+            }
+            // enqueueVisible re-queues a column while it is still generating (it left pendingSet at
+            // dequeue, so the dedup guard cannot see it); once the original finishes, queued
+            // duplicates only need to be dropped
+            if (this.columns.containsKey(packed)) {
+                continue;
             }
             try {
                 this.generateColumn(packed);
@@ -574,8 +587,7 @@ public final class LodMapRenderer {
             if (cached != null) {
                 Column col = new Column(packed);
                 col.image = cached;
-                this.columns.put(packed, col);
-                this.uploads.add(col);
+                this.publish(col);
             }
             return;
         }
@@ -585,8 +597,7 @@ public final class LodMapRenderer {
         if (cached != null) {
             Column col = new Column(packed);
             col.image = cached;
-            this.columns.put(packed, col);
-            this.uploads.add(col);
+            this.publish(col);
             return;
         }
         Long2ObjectOpenHashMap<LongArrayList> secs = this.secKeys;
@@ -660,7 +671,16 @@ public final class LodMapRenderer {
         MapCache.INSTANCE.saveImage(colX, colZ, img, MapCache.computeHash(lvl0Keys(keys)));
         Column col = new Column(packed);
         col.image = img;
-        this.columns.put(packed, col);
+        this.publish(col);
+    }
+
+    /** Publishes a finished column and queues its texture upload; a duplicate generation that
+     * replaces an existing column parks the old one in staleColumns for the render thread to free. */
+    private void publish(Column col) {
+        Column prev = this.columns.put(col.packed, col);
+        if (prev != null) {
+            this.staleColumns.add(prev);
+        }
         this.uploads.add(col);
     }
 
@@ -759,11 +779,26 @@ public final class LodMapRenderer {
     }
 
     private void processUploads() {
+        // GL resources may only be freed on the render thread: close textures of replaced duplicates
+        Column stale;
+        while ((stale = this.staleColumns.poll()) != null) {
+            if (stale.texture != null) {
+                stale.texture.close();
+            }
+        }
         int n = 0;
         Column c;
         while (n < MAX_UPLOADS_PER_FRAME && (c = this.uploads.poll()) != null) {
             n++;
             final Column cur = c;
+            // A duplicate generation may have finished first; only the column still in the map
+            // uploads, the loser's image is dropped before any texture wraps it
+            if (this.columns.get(cur.packed) != cur) {
+                if (cur.texture == null && cur.image != null) {
+                    cur.image.close();
+                }
+                continue;
+            }
             DynamicTexture tex = new DynamicTexture(
                     () -> "voxyrenderfilter-map-" + cur.colX + "_" + cur.colZ, cur.image);
             tex.upload();
