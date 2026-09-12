@@ -32,8 +32,14 @@ public final class RenderNodeRefresh {
 
     /** Reschedule interval (ms) while waiting for AsyncNodeManager to process a removal batch. */
     private static final long RE_ADD_POLL_INTERVAL_MILLIS = 20;
-    /** Timeout (ms) for removal processing; on timeout rebuild anyway (voxy may ignore it, but nothing blocks). */
-    private static final long RE_ADD_TIMEOUT_MILLIS = 5000;
+    /**
+     * Last-resort deadline (ms) for the removal wait. voxy normally drains removals within one
+     * async cycle, but large purges queue thousands of removals and voxy syncs its results with
+     * the render thread, so the drain can stall well beyond a second; re-adding earlier would
+     * cancel the still-pending removals (addTopLevel strips the id from tlnRem) and resurrect the
+     * stale nodes.
+     */
+    private static final long RE_ADD_TIMEOUT_MILLIS = 30000;
     /** Shared daemon scheduler for the delayed re-add checks. */
     private static final ScheduledExecutorService RE_ADD_SCHEDULER = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "VRF TLN re-add");
@@ -128,26 +134,51 @@ public final class RenderNodeRefresh {
         return true;
     }
 
-    /** Re-adds after AsyncNodeManager's background thread processed the removal batch; without this
-     * wait, addTopLevel cancels the unprocessed removeTopLevel and nodes never rebuild. */
+    /** Re-adds after AsyncNodeManager's background thread processed each column's removals; without
+     * this wait, addTopLevel cancels the unprocessed removeTopLevel and nodes never rebuild. */
     private static void scheduleReAdd(Minecraft mc, LongOpenHashSet removed, int minSec, int maxSec) {
         LongOpenHashSet columns = new LongOpenHashSet(removed);
         scheduleReAddCheck(0, mc, columns, minSec, maxSec, System.currentTimeMillis() + RE_ADD_TIMEOUT_MILLIS);
     }
 
+    /**
+     * Waits for voxy to process each column's removal and re-adds columns as they become ready:
+     * an add while the removal is still queued only cancels the removal (addTopLevel strips the
+     * id from tlnRem), which resurrects the stale node and blocks the rebuild. Large purges hold
+     * thousands of removals, so per-column readiness replaces a fixed whole-batch timeout; the
+     * deadline is only a last resort for removals voxy never drains.
+     */
     private static void scheduleReAddCheck(long delayMs, Minecraft mc, LongOpenHashSet columns,
                                            int minSec, int maxSec, long deadline) {
         RE_ADD_SCHEDULER.schedule(() -> {
-            if (System.currentTimeMillis() < deadline && hasPendingRemoval(columns, minSec, maxSec)) {
-                scheduleReAddCheck(RE_ADD_POLL_INTERVAL_MILLIS, mc, columns, minSec, maxSec, deadline);
+            if (columns.isEmpty()) {
                 return;
             }
-            mc.execute(() -> reAddColumns(mc, columns));
+            LongOpenHashSet ready = new LongOpenHashSet();
+            if (!collectDrained(columns, minSec, maxSec, ready)) {
+                return; // render system gone, nothing to rebuild
+            }
+            if (!ready.isEmpty()) {
+                mc.execute(() -> reAddColumns(mc, ready));
+            }
+            if (!columns.isEmpty()) {
+                if (System.currentTimeMillis() < deadline) {
+                    scheduleReAddCheck(RE_ADD_POLL_INTERVAL_MILLIS, mc, columns, minSec, maxSec, deadline);
+                } else {
+                    // Last resort: re-add anyway; worst case a pending removal is cancelled and
+                    // the stale node stays until the ring rebuilds it
+                    mc.execute(() -> reAddColumns(mc, columns));
+                }
+            }
         }, delayMs, TimeUnit.MILLISECONDS);
     }
 
-    /** Whether any removal of this batch is still unprocessed (its node ids remain in tlnRem). */
-    private static boolean hasPendingRemoval(LongOpenHashSet columns, int minSec, int maxSec) {
+    /**
+     * Moves columns whose removal voxy has processed (none of their node ids remain in tlnRem)
+     * from {@code columns} into {@code ready}. Returns false when the render system is gone.
+     * Runs on the re-add scheduler thread; tlnRem is read under its StampedLock.
+     */
+    private static boolean collectDrained(LongOpenHashSet columns, int minSec, int maxSec, LongOpenHashSet ready) {
         VoxyRenderSystem renderSystem = IVoxyRenderSystemHolder.getNullable();
         if (renderSystem == null) {
             return false;
@@ -159,20 +190,28 @@ public final class RenderNodeRefresh {
         long stamp = lock.readLock();
         try {
             if (rem.isEmpty()) {
-                return false;
+                ready.addAll(columns);
+                columns.clear();
+                return true;
             }
             LongIterator it = columns.iterator();
             while (it.hasNext()) {
                 long packed = it.nextLong();
                 int tx = ActiveTopLevelTracker.columnX(packed);
                 int tz = ActiveTopLevelTracker.columnZ(packed);
+                boolean pending = false;
                 for (int y = minSec; y <= maxSec; y++) {
                     if (rem.contains(WorldEngine.getWorldSectionId(4, tx, y, tz))) {
-                        return true;
+                        pending = true;
+                        break;
                     }
                 }
+                if (!pending) {
+                    it.remove();
+                    ready.add(packed);
+                }
             }
-            return false;
+            return true;
         } finally {
             lock.unlockRead(stamp);
         }

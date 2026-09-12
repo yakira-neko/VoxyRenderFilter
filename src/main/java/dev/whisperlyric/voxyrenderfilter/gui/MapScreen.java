@@ -34,6 +34,7 @@ import net.minecraft.world.level.Level;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -44,6 +45,7 @@ import java.util.List;
  * right-click empty space to clear, scroll to zoom (centered on the cursor), WASD/arrows to pan.
  * Selection snaps to region files (32x32 chunks) at low zoom and to lvl0 sections (2x2 chunks)
  * once sections are visible. Ctrl toggles multi-select; Shift forces a square selection.
+ * Overlapping selections are unioned into pairwise-disjoint rectangles after each drag.
  */
 public class MapScreen extends Screen {
 
@@ -1376,8 +1378,12 @@ public class MapScreen extends Screen {
 
     @Override
     public boolean mouseReleased(MouseButtonEvent event) {
+        boolean boxFinished = this.dragging;
         this.dragging = false;
         this.panning = false;
+        if (boxFinished) {
+            this.normalizeSelections();
+        }
         if (this.rightDragging) {
             this.rightDragging = false;
             int[] p = this.snapToUnit(event.x(), event.y(), this.rightSelSectionUnit);
@@ -1442,6 +1448,105 @@ public class MapScreen extends Screen {
             out.add(new RectFilter(cx1, bz2, cx2 - 1, az2 - 1));
         }
         return out;
+    }
+
+    /**
+     * Normalizes the selection list into pairwise-disjoint rectangles: overlapping selections are
+     * unioned and re-partitioned via coordinate compression, so no area is covered twice. Pieces
+     * covering any region-unit (coarse) cell become region-unit; all-section pieces stay
+     * section-unit. Called when a left-drag selection finishes; subtract keeps disjointness, so
+     * the invariant holds afterwards.
+     */
+    private void normalizeSelections() {
+        if (this.selections.size() < 2) {
+            return;
+        }
+        int count = this.selections.size();
+        int[] xs = new int[count * 2];
+        int[] zs = new int[count * 2];
+        int k = 0;
+        for (SelRect sel : this.selections) {
+            xs[k] = sel.chunkRect().minX();
+            xs[k + 1] = sel.chunkRect().maxX() + 1;
+            zs[k] = sel.chunkRect().minZ();
+            zs[k + 1] = sel.chunkRect().maxZ() + 1;
+            k += 2;
+        }
+        Arrays.sort(xs);
+        Arrays.sort(zs);
+        int nx = 0;
+        for (int v : xs) {
+            if (nx == 0 || xs[nx - 1] != v) {
+                xs[nx++] = v;
+            }
+        }
+        int nz = 0;
+        for (int v : zs) {
+            if (nz == 0 || zs[nz - 1] != v) {
+                zs[nz++] = v;
+            }
+        }
+        boolean[][] covered = new boolean[nx - 1][nz - 1];
+        boolean[][] regionCell = new boolean[nx - 1][nz - 1];
+        for (SelRect sel : this.selections) {
+            RectFilter r = sel.chunkRect();
+            int xi0 = Arrays.binarySearch(xs, 0, nx, r.minX());
+            int xi1 = Arrays.binarySearch(xs, 0, nx, r.maxX() + 1);
+            int zi0 = Arrays.binarySearch(zs, 0, nz, r.minZ());
+            int zi1 = Arrays.binarySearch(zs, 0, nz, r.maxZ() + 1);
+            for (int i = xi0; i < xi1; i++) {
+                for (int j = zi0; j < zi1; j++) {
+                    covered[i][j] = true;
+                    if (!sel.sectionUnit()) {
+                        regionCell[i][j] = true;
+                    }
+                }
+            }
+        }
+        List<SelRect> merged = new ArrayList<>();
+        for (int j = 0; j < nz - 1; j++) {
+            for (int i = 0; i < nx - 1; i++) {
+                if (!covered[i][j]) {
+                    continue;
+                }
+                // Maximal covered x-run in this z-band, extended down while the identical span
+                // stays covered; consumed cells are cleared so lower bands scan fresh
+                int i2 = i;
+                while (i2 + 1 < nx - 1 && covered[i2 + 1][j]) {
+                    i2++;
+                }
+                int j2 = j;
+                extendDown:
+                while (j2 + 1 < nz - 1) {
+                    for (int t = i; t <= i2; t++) {
+                        if (!covered[t][j2 + 1]) {
+                            break extendDown;
+                        }
+                    }
+                    j2++;
+                }
+                boolean anyRegion = false;
+                for (int t = i; t <= i2 && !anyRegion; t++) {
+                    for (int u = j; u <= j2; u++) {
+                        if (regionCell[t][u]) {
+                            anyRegion = true;
+                            break;
+                        }
+                    }
+                }
+                for (int t = i; t <= i2; t++) {
+                    for (int u = j; u <= j2; u++) {
+                        covered[t][u] = false;
+                    }
+                }
+                merged.add(new SelRect(
+                        new RectFilter(xs[i], zs[j], xs[i2 + 1] - 1, zs[j2 + 1] - 1),
+                        !anyRegion));
+                i = i2;
+            }
+        }
+        this.selections.clear();
+        this.selections.addAll(merged);
     }
 
     @Override
