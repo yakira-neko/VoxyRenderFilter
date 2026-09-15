@@ -12,7 +12,7 @@ val mixinVersion: String by project
 val modNameStripped = modName.replace(" ", "")
 
 plugins {
-	id("net.fabricmc.fabric-loom") version "1.16-SNAPSHOT"
+	id("net.fabricmc.fabric-loom") version "1.17-SNAPSHOT"
 	id("maven-publish")
 }
 
@@ -35,7 +35,7 @@ dependencies {
 
 	// 编译期引用 voxy 类（RenderDistanceTracker 等），运行时由玩家自行安装 voxy。
 	// voxy 的类名与方法名（add）不经 remap，直接以本地 jar 作 compileOnly 即可。
-	compileOnly(files("libs/voxy-0.2.18-beta-26.1.2.jar"))
+	compileOnly(files("libs/voxy-0.2.19-beta.jar"))
 }
 
 tasks.processResources {

@@ -40,3 +40,6 @@ replay_*.log
 *.jfr
 
 libs/
+
+# local build tooling (JDK, voxy reference jars, mirror proxy)
+.tools/

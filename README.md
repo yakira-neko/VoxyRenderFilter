@@ -67,7 +67,7 @@ Shows the voxy LOD cache coverage on an in-game map, with region-based render fi
 
 | Minecraft | Loader | Java |
 |-----------|--------|------|
-| 26.1      | Fabric | 25+  |
+| 26.2      | Fabric | 25+  |
 
 ## Usage
 

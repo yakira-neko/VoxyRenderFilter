@@ -36,10 +36,11 @@ public final class VoxyRenderFilterKeybinds {
     }
 
     private static void toggleMap(Minecraft client) {
-        if (client.screen instanceof MapScreen) {
-            client.setScreen(null);
+        // 26.2: the screen accessors moved off Minecraft onto Gui
+        if (client.gui.screen() instanceof MapScreen) {
+            client.gui.setScreen(null);
         } else {
-            client.setScreen(new MapScreen());
+            client.gui.setScreen(new MapScreen());
         }
     }
 }
