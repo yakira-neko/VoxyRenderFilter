@@ -56,7 +56,28 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Build
-        run: ./gradlew build --no-daemon --stacktrace
+        run: |
+          set -euo pipefail
+          # Maven Central is Cloudflare-fronted and intermittently answers 403 to GitHub's
+          # shared runner IP ranges. Gradle's own repository retry only covers 429, so such a
+          # 403 aborts the build. Retry *only* on that signature: a genuine compile error must
+          # surface immediately rather than being masked by repeated attempts.
+          for attempt in 1 2 3; do
+            if ./gradlew build --no-daemon --stacktrace 2>&1 | tee gradle-build.log; then
+              exit 0
+            fi
+            if grep -qE 'Received status code (403|429|5[0-9][0-9])|Could not resolve all|Connection reset|Read timed out' gradle-build.log; then
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::Transient dependency-fetch failure (attempt ${attempt}); retrying"
+                sleep $((attempt * 20))
+                continue
+              fi
+              echo "::error::Transient dependency-fetch failure persisted across 3 attempts"
+              exit 1
+            fi
+            echo "::error::Build failed for a non-transient reason; not retrying"
+            exit 1
+          done
 
       - name: Stage release artifacts
         run: |
