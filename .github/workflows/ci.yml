@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '26.2-fabric'
+      - '26.1.2-fabric'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default; the release job opts into contents: write.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # build.gradle.kts compiles against libs/voxy-0.2.19-beta.jar (compileOnly), and libs/ is
+  # gitignored, so a fresh checkout has no such jar. The Modrinth-published artifact is the
+  # upstream-distributed build of exactly that file, so CI fetches it instead of vendoring a
+  # 12 MB All-Rights-Reserved binary into this LGPL repository.
+  VOXY_JAR_URL: https://api.modrinth.com/maven/maven/modrinth/voxy/0.2.19-beta/voxy-0.2.19-beta.jar
+  # SHA-256 of the artifact above; the download is rejected if it ever changes.
+  VOXY_JAR_SHA256: a06e4d93db88dc22d6cde6dfe1e58d8428ae271d1f432bbb430735336f4b5c12
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # The wrapper jar is committed mode 100644, so the checked-out file is not executable.
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Fetch compile-only voxy jar
+        run: |
+          set -euo pipefail
+          mkdir -p libs
+          curl -fsSL --retry 3 --retry-delay 5 -o libs/voxy-0.2.19-beta.jar "$VOXY_JAR_URL"
+          echo "${VOXY_JAR_SHA256}  libs/voxy-0.2.19-beta.jar" | sha256sum -c -
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build
+        run: ./gradlew build --no-daemon --stacktrace
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/libs/*.jar dist/
+          ls -l dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: mod-jar
+          path: dist/*.jar
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    # Only tag pushes produce a release, so ordinary branch/PR runs stop at a green build.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: mod-jar
+          path: dist
+
+      - name: Show artifacts
+        run: ls -l dist
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.jar
+          generate_release_notes: true
+          draft: false
+          prerelease: false
