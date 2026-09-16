@@ -41,9 +41,33 @@ jobs:
           distribution: temurin
           java-version: '25'
 
-      # The wrapper jar is committed mode 100644, so the checked-out file is not executable.
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      # Make gradlew executable: the file is committed mode 100644, so a Linux checkout is not.
+      - name: Prepare Gradle wrapper
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          grep '^distributionUrl' gradle/wrapper/gradle-wrapper.properties
+
+      # gradle-wrapper.properties points at a China-hosted mirror, which is right for local
+      # development but routinely takes 20+ minutes from GitHub's US runners (observed: 2.5 min
+      # vs 24 min for the same 140 MB download).
+      #
+      # Rewrite only the host/path prefix and keep the version + filename from the file, so a
+      # later wrapper bump cannot silently pin CI to an older Gradle.
+      - name: Point wrapper at the canonical distribution CDN
+        run: |
+          set -euo pipefail
+          f=gradle/wrapper/gradle-wrapper.properties
+          # The committed value escapes the colon ("https\://"), so allow an optional backslash.
+          sed -i -E 's#^(distributionUrl=https)\\?://mirrors\.aliyun\.com/gradle/distributions/v[^/]+/#\1://services.gradle.org/distributions/#' "$f"
+          grep '^distributionUrl' "$f"
+          if ! grep -q '^distributionUrl=https://services\.gradle\.org/distributions/' "$f"; then
+            echo "::error::wrapper distribution URL was not repointed; CI would use a slow mirror"
+            exit 1
+          fi
+
+      # The wrapper distribution (~140 MB) is cached by gradle/actions/setup-gradle below
+      # (it restores ~/.gradle/wrapper), so no separate cache step is needed here.
 
       - name: Fetch compile-only voxy jar
         run: |
@@ -54,6 +78,11 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
+        with:
+          # setup-gradle only *writes* caches on the default branch, which for this fork is
+          # 26.1.2-fabric. Without this, runs on 26.2-fabric stay cold forever (observed:
+          # "Gradle User Home cache not found") and re-download every dependency each time.
+          cache-read-only: false
 
       - name: Build
         run: |
